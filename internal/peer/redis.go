@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -15,6 +14,7 @@ import (
 	"github.com/honeycombio/samproxy/config"
 	"github.com/honeycombio/samproxy/internal/redimem"
 	"github.com/sirupsen/logrus"
+  "github.com/Showmax/go-fqdn"
 )
 
 const (
@@ -176,7 +176,7 @@ func publicAddr(c config.Config) (string, error) {
 		return "", err
 	}
 
-	myIdentifier, _ := os.Hostname()
+	myIdentifier, _ := fqdn.FqdnHostname()
 	identifierInterfaceName, _ := c.GetIdentifierInterfaceName()
 
 	if identifierInterfaceName != "" {
