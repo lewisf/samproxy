@@ -1,5 +1,5 @@
 #####################
-## Samproxy Config ##
+## Refinery Config ##
 #####################
 
 # ListenAddr is the IP and port on which to listen for incoming events. Incoming
@@ -35,7 +35,7 @@ APIKeys = [
 HoneycombAPI = "https://api.honeycomb.io"
 
 # SendDelay is a short timer that will be triggered when a trace is complete.
-# Samproxy will wait this duration before actually sending the trace.  The
+# Refinery will wait this duration before actually sending the trace.  The
 # reason for this short delay is to allow for small network delays or clock
 # jitters to elapse and any final spans to arrive before actually sending the
 # trace.  This supports duration strings with supplied units. Set to 0 for
@@ -76,7 +76,7 @@ PeerBufferSize = 10000
 ## Implementation Choices ##
 ############################
 
-# Each of the config options below chooses an implementation of a Samproxy
+# Each of the config options below chooses an implementation of a Refinery
 # component to use. Depending on the choice there may be more configuration
 # required below in the section for that choice. Changing implementation choices
 # requires a process restart; these changes will not be picked up by a live
@@ -88,12 +88,12 @@ PeerBufferSize = 10000
 # implementations of the Collector interface.
 Collector = "InMemCollector"
 
-# Logger describes which logger to use for Samproxy logs. Valid options are
+# Logger describes which logger to use for Refinery logs. Valid options are
 # "logrus" and "honeycomb". The logrus option will write logs to STDOUT and the
 # honeycomb option will send them to a Honeycomb dataset.
-Logger = "logrus"
+Logger = "honeycomb"
 
-# Metrics describes which service to use for Samproxy metrics. Valid options are
+# Metrics describes which service to use for Refinery metrics. Valid options are
 # "prometheus" and "honeycomb". The prometheus option starts a listener that
 # will reply to a request for /metrics. The honeycomb option will send summary
 # metrics to a Honeycomb dataset.
@@ -114,33 +114,33 @@ Metrics = "honeycomb"
 	# "http://127.0.0.1:8081",
 	# "http://127.0.0.1:8081",
 	# "http://10.1.2.3.4:8080",
-	# "http://samproxy-1231:8080",
+	# "http://refinery-1231:8080",
 	# "http://peer-3.fqdn" // assumes port 80
 # ]
 
 # [PeerManagement]
 # Type = "redis"
 # RedisHost is is used to connect to redis for peer cluster membership management.
-# Further, if the environment variable 'SAMPROXY_REDIS_HOST' is set it takes
+# Further, if the environment variable 'REFINERY_REDIS_HOST' is set it takes
 # precedence and this value is ignored.
 # Not eligible for live reload.
 # RedisHost = "localhost:6379"
 
-# IdentifierInterfaceName is optional. By default, when using RedisHost, samproxy will use
+# IdentifierInterfaceName is optional. By default, when using RedisHost, Refinery will use
 # the local hostname to identify itself to other peers in Redis. If your environment
 # requires that you use IPs as identifiers (for example, if peers can't resolve eachother
-# by name), you can specify the network interface that samproxy is listening on here.
-# Samproxy will use the first unicast address that it finds on the specified network
+# by name), you can specify the network interface that Refinery is listening on here.
+# Refinery will use the first unicast address that it finds on the specified network
 # interface as its identifier.
 # Not eligible for live reload.
 # IdentifierInterfaceName = "eth0"
 
-# UseIPV6Identifier is optional. If using IdentifierInterfaceName, samproxy will default to the first
+# UseIPV6Identifier is optional. If using IdentifierInterfaceName, Refinery will default to the first
 # IPv4 unicast address it finds for the specified interface. If UseIPV6Identifier is used, will use
 # the first IPV6 unicast address found.
 # UseIPV6Identifier = false
 
-# RedisIdentifier is optional. By default, when using RedisHost, samproxy will use
+# RedisIdentifier is optional. By default, when using RedisHost, Refinery will use
 # the local hostname to identify itself to other peers in Redis. If your environment
 # requires that you use IPs as identifiers (for example, if peers can't resolve eachother
 # by name), you can specify the exact identifier (IP address, etc) to use here.
@@ -166,6 +166,15 @@ Metrics = "honeycomb"
 # temporary odd sampling decisions).
 CacheCapacity = 1000
 
+# MaxAlloc is optional. If set, it must be an integer >= 0. 64-bit values are
+# supported.
+# If set to a non-zero value, once per tick (see SendTicker) the collector
+# will compare total allocated bytes to this value. If allocation is too
+# high, cache capacity will be reduced and an error will be logged.
+# Useful values for this setting are generally in the range of 75%-90% of
+# available system memory.
+MaxAlloc = 0
+
 ###################
 ## Logrus Logger ##
 ###################
@@ -190,17 +199,17 @@ CacheCapacity = 1000
 
 # LoggerHoneycombAPI is the URL for the upstream Honeycomb API.
 # Eligible for live reload.
-# LoggerHoneycombAPI = "https://api.honeycomb.io"
+ LoggerHoneycombAPI = "https://api.honeycomb.io"
 
 # LoggerAPIKey is the API key to use to send log events to the Honeycomb logging
 # dataset. This is separate from the APIKeys used to authenticate regular
 # traffic.
 # Eligible for live reload.
-# LoggerAPIKey = "abcd1234"
+ LoggerAPIKey = "abcd1234"
 
-# LoggerDataset is the name of the dataset to which to send Samproxy logs
+# LoggerDataset is the name of the dataset to which to send Refinery logs
 # Eligible for live reload.
-# LoggerDataset = "Samproxy Logs"
+ LoggerDataset = "Refinery Logs"
 
 
 #######################
@@ -224,9 +233,9 @@ MetricsHoneycombAPI = "https://api.honeycomb.io"
 # Eligible for live reload.
 MetricsAPIKey = "abcd1234"
 
-# MetricsDataset is the name of the dataset to which to send Samproxy metrics
+# MetricsDataset is the name of the dataset to which to send Refinery metrics
 # Eligible for live reload.
-MetricsDataset = "Samproxy Metrics"
+MetricsDataset = "Refinery Metrics"
 
 # MetricsReportingInterval is the frequency (in seconds) to send metric events
 # to Honeycomb. Between 1 and 60 is recommended.
@@ -241,7 +250,7 @@ MetricsReportingInterval = 3
 [PrometheusMetrics]
 
 # MetricsListenAddr determines the interface and port on which Prometheus will
-# listen for requests for /metrics. Must be different from the main Samproxy
+# listen for requests for /metrics. Must be different from the main Refinery
 # listener.
 # Not eligible for live reload.
 # MetricsListenAddr = "localhost:2112"

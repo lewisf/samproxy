@@ -3,6 +3,7 @@ package route
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,20 +12,21 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
+	jsoniter "github.com/json-iterator/go"
 	"github.com/klauspost/compress/zstd"
-	"github.com/tinylib/msgp/msgp"
 	"github.com/vmihailenco/msgpack/v4"
 
-	"github.com/honeycombio/samproxy/collect"
-	"github.com/honeycombio/samproxy/config"
-	"github.com/honeycombio/samproxy/logger"
-	"github.com/honeycombio/samproxy/metrics"
-	"github.com/honeycombio/samproxy/sharder"
-	"github.com/honeycombio/samproxy/transmit"
-	"github.com/honeycombio/samproxy/types"
+	"github.com/honeycombio/refinery/collect"
+	"github.com/honeycombio/refinery/config"
+	"github.com/honeycombio/refinery/logger"
+	"github.com/honeycombio/refinery/metrics"
+	"github.com/honeycombio/refinery/sharder"
+	"github.com/honeycombio/refinery/transmit"
+	"github.com/honeycombio/refinery/types"
 )
 
 const (
@@ -55,14 +57,34 @@ type Router struct {
 	incomingOrPeer string
 
 	// iopLogger is a logger that knows whether it's incoming or peer
-	iopLogger logger.Entry
+	iopLogger iopLogger
 
 	zstdDecoders chan *zstd.Decoder
+
+	server *http.Server
+	doneWG sync.WaitGroup
 }
 
 type BatchResponse struct {
 	Status int    `json:"status"`
 	Error  string `json:"error,omitempty"`
+}
+
+type iopLogger struct {
+	logger.Logger
+	incomingOrPeer string
+}
+
+func (i *iopLogger) Debug() logger.Entry {
+	return i.Logger.Debug().WithField("router_iop", i.incomingOrPeer)
+}
+
+func (i *iopLogger) Info() logger.Entry {
+	return i.Logger.Info().WithField("router_iop", i.incomingOrPeer)
+}
+
+func (i *iopLogger) Error() logger.Entry {
+	return i.Logger.Error().WithField("router_iop", i.incomingOrPeer)
 }
 
 func (r *Router) SetVersion(ver string) {
@@ -75,7 +97,10 @@ func (r *Router) SetVersion(ver string) {
 // prioritized.
 func (r *Router) LnS(incomingOrPeer string) {
 	r.incomingOrPeer = incomingOrPeer
-	r.iopLogger = r.Logger.WithField("router_iop", r.incomingOrPeer)
+	r.iopLogger = iopLogger{
+		Logger:         r.Logger,
+		incomingOrPeer: incomingOrPeer,
+	}
 
 	r.proxyClient = &http.Client{
 		Timeout:   time.Second * 10,
@@ -85,15 +110,17 @@ func (r *Router) LnS(incomingOrPeer string) {
 	var err error
 	r.zstdDecoders, err = makeDecoders(numZstdDecoders)
 	if err != nil {
-		r.iopLogger.Errorf("couldn't start zstd decoders: %s", err.Error())
+		r.iopLogger.Error().Logf("couldn't start zstd decoders: %s", err.Error())
 		return
 	}
 
 	r.Metrics.Register(r.incomingOrPeer+"_router_proxied", "counter")
 	r.Metrics.Register(r.incomingOrPeer+"_router_event", "counter")
 	r.Metrics.Register(r.incomingOrPeer+"_router_batch", "counter")
+	r.Metrics.Register(r.incomingOrPeer+"_router_nonspan", "counter")
 	r.Metrics.Register(r.incomingOrPeer+"_router_span", "counter")
 	r.Metrics.Register(r.incomingOrPeer+"_router_peer", "counter")
+	r.Metrics.Register(r.incomingOrPeer+"_router_dropped", "counter")
 
 	muxxer := mux.NewRouter()
 
@@ -121,27 +148,47 @@ func (r *Router) LnS(incomingOrPeer string) {
 	if r.incomingOrPeer == "incoming" {
 		listenAddr, err = r.Config.GetListenAddr()
 		if err != nil {
-			r.iopLogger.Errorf("failed to get listen addr config: %s", err)
+			r.iopLogger.Error().Logf("failed to get listen addr config: %s", err)
 			return
 		}
 	} else {
 		listenAddr, err = r.Config.GetPeerListenAddr()
 		if err != nil {
-			r.iopLogger.Errorf("failed to get peer listen addr config: %s", err)
+			r.iopLogger.Error().Logf("failed to get peer listen addr config: %s", err)
 			return
 		}
 	}
 
-	r.iopLogger.Infof("Listening on %s", listenAddr)
-	err = http.ListenAndServe(listenAddr, muxxer)
-	if err != nil {
-		r.iopLogger.Errorf("failed to ListenAndServe: %s", err)
+	r.iopLogger.Info().Logf("Listening on %s", listenAddr)
+	r.server = &http.Server{
+		Addr:    listenAddr,
+		Handler: muxxer,
 	}
+
+	r.doneWG.Add(1)
+	go func() {
+		defer r.doneWG.Done()
+
+		err = r.server.ListenAndServe()
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			r.iopLogger.Error().Logf("failed to ListenAndServe: %s", err)
+		}
+	}()
+}
+
+func (r *Router) Stop() error {
+	ctx, _ := context.WithTimeout(context.Background(), time.Minute)
+	err := r.server.Shutdown(ctx)
+	if err != nil {
+		return err
+	}
+	r.doneWG.Wait()
+	return nil
 }
 
 func (r *Router) alive(w http.ResponseWriter, req *http.Request) {
-	r.iopLogger.Debugf("answered /x/alive check")
-	w.Write([]byte(`{"source":"samproxy","alive":true}`))
+	r.iopLogger.Debug().Logf("answered /x/alive check")
+	w.Write([]byte(`{"source":"refinery","alive":"yes"}`))
 }
 
 func (r *Router) panic(w http.ResponseWriter, req *http.Request) {
@@ -149,121 +196,38 @@ func (r *Router) panic(w http.ResponseWriter, req *http.Request) {
 }
 
 func (r *Router) version(w http.ResponseWriter, req *http.Request) {
-	w.Write([]byte(fmt.Sprintf(`{"source":"samproxy","version":"%s"}`, r.versionStr)))
+	w.Write([]byte(fmt.Sprintf(`{"source":"refinery","version":"%s"}`, r.versionStr)))
 }
 
 // event is handler for /1/event/
 func (r *Router) event(w http.ResponseWriter, req *http.Request) {
+	r.Metrics.IncrementCounter(r.incomingOrPeer + "_router_event")
 	defer req.Body.Close()
 
-	// get out request ID for logging
-	reqID := req.Context().Value(types.RequestIDContextKey{})
-	logger := r.iopLogger.WithField("request_id", reqID)
-
-	reqBod, _ := ioutil.ReadAll(req.Body)
-	var trEv eventWithTraceID
-	// pull out just the trace ID for use in routing
-	err := unmarshal(req, bytes.NewReader(reqBod), &trEv)
+	bodyReader, err := r.getMaybeCompressedBody(req)
 	if err != nil {
-		logger.WithField("error", err.Error()).WithField("request.url", req.URL).WithField("json_body", string(reqBod)).Debugf("error parsing json")
-		r.handlerReturnWithError(w, ErrJSONFailed, err)
+		r.handlerReturnWithError(w, ErrPostBody, err)
 		return
 	}
 
-	// not part of a trace. send along upstream
-	if trEv.TraceID == "" {
-		r.Metrics.IncrementCounter(r.incomingOrPeer + "_router_event")
-		ev, err := r.requestToEvent(req, reqBod)
-		if err != nil {
-			r.handlerReturnWithError(w, ErrReqToEvent, err)
-			return
-		}
-		ev.Type = types.EventTypeEvent
-		ev.Target = types.TargetUpstream
-		logger.WithFields(map[string]interface{}{
-			"api_host": ev.APIHost,
-			"dataset":  ev.Dataset,
-		}).Debugf("sending non-trace event")
-		r.UpstreamTransmission.EnqueueEvent(ev)
+	reqBod, err := ioutil.ReadAll(bodyReader)
+	if err != nil {
+		r.handlerReturnWithError(w, ErrPostBody, err)
 		return
 	}
 
-	// ok, we're a span. Figure out if we should handle locally or pass on to a
-	// peer
-	targetShard := r.Sharder.WhichShard(trEv.TraceID)
-	if !targetShard.Equals(r.Sharder.MyShard()) {
-		// it's not for us; send to the peer
-		r.Metrics.IncrementCounter(r.incomingOrPeer + "_router_peer")
-		ev, err := r.requestToEvent(req, reqBod)
-		if err != nil {
-			r.handlerReturnWithError(w, ErrReqToEvent, err)
-			return
-		}
-		ev.Type = types.EventTypeSpan
-		ev.Target = types.TargetPeer
-		ev.APIHost = targetShard.GetAddress()
-		logger.WithFields(map[string]interface{}{
-			"api_host": ev.APIHost,
-			"dataset":  ev.Dataset,
-			"trace_id": trEv.TraceID,
-			"peer":     targetShard.GetAddress(),
-		}).Debugf("Sending span to my peer")
-		r.PeerTransmission.EnqueueEvent(ev)
-		return
-	}
-	// we're supposed to handle it
 	ev, err := r.requestToEvent(req, reqBod)
 	if err != nil {
 		r.handlerReturnWithError(w, ErrReqToEvent, err)
 		return
 	}
-	ev.Type = types.EventTypeSpan
-	ev.Target = types.TargetUpstream
-	span := &types.Span{
-		Event:   *ev,
-		TraceID: trEv.TraceID,
-	}
-	r.Metrics.IncrementCounter(r.incomingOrPeer + "_router_span")
-	logger.WithFields(map[string]interface{}{
-		"api_host": ev.APIHost,
-		"dataset":  ev.Dataset,
-		"trace_id": trEv.TraceID,
-	}).Debugf("Accepting span for collection into a trace")
-	if r.incomingOrPeer == "incoming" {
-		r.Collector.AddSpan(span)
-	} else {
-		r.Collector.AddSpanFromPeer(span)
-	}
-}
 
-type eventWithTraceID struct {
-	TraceID string
-}
-
-func (ev *eventWithTraceID) UnmarshalJSON(b []byte) error {
-	return ev.Unmarshal(b, json.Unmarshal)
-}
-
-func (ev *eventWithTraceID) UnmarshalMsgpack(b []byte) error {
-	return ev.Unmarshal(b, msgpack.Unmarshal)
-}
-
-func (ev *eventWithTraceID) Unmarshal(b []byte, u func(d []byte, v interface{}) error) error {
-	var e map[string]string
-
-	err := u(b, &e)
-
+	reqID := req.Context().Value(types.RequestIDContextKey{})
+	err = r.processEvent(ev, reqID)
 	if err != nil {
-		return err
+		r.handlerReturnWithError(w, ErrReqToEvent, err)
+		return
 	}
-
-	if id := e["trace.trace_id"]; id != "" {
-		ev.TraceID = id
-	} else if id := e["traceId"]; id != "" {
-		ev.TraceID = id
-	}
-
-	return nil
 }
 
 func (r *Router) requestToEvent(req *http.Request, reqBod []byte) (*types.Event, error) {
@@ -306,7 +270,7 @@ func (r *Router) batch(w http.ResponseWriter, req *http.Request) {
 	defer req.Body.Close()
 
 	reqID := req.Context().Value(types.RequestIDContextKey{})
-	logger := r.iopLogger.WithField("request_id", reqID)
+	debugLog := r.iopLogger.Debug().WithField("request_id", reqID)
 
 	bodyReader, err := r.getMaybeCompressedBody(req)
 	if err != nil {
@@ -321,110 +285,42 @@ func (r *Router) batch(w http.ResponseWriter, req *http.Request) {
 	}
 
 	batchedEvents := make([]batchedEvent, 0)
-	batchedResponses := make([]*BatchResponse, 0)
 	err = unmarshal(req, bytes.NewReader(reqBod), &batchedEvents)
 	if err != nil {
-		logger.WithField("error", err.Error()).WithField("request.url", req.URL).WithField("json_body", string(reqBod)).Debugf("error parsing json")
+		debugLog.WithField("error", err.Error()).WithField("request.url", req.URL).WithField("json_body", string(reqBod)).Logf("error parsing json")
 		r.handlerReturnWithError(w, ErrJSONFailed, err)
 		return
 	}
 
+	batchedResponses := make([]*BatchResponse, 0, len(batchedEvents))
 	for _, bev := range batchedEvents {
-		// extract trace ID, route to self or peer, pass on to collector
-		// TODO make trace ID field configurable
-		var traceID string
-		if trID, ok := bev.Data["trace.trace_id"]; ok {
-			traceID = trID.(string)
-		} else if trID, ok := bev.Data["traceId"]; ok {
-			traceID = trID.(string)
-		}
-		if traceID == "" {
-			// not part of a trace. send along upstream
-			r.Metrics.IncrementCounter(r.incomingOrPeer + "_router_event")
-			ev, err := r.batchedEventToEvent(req, bev)
-			if err != nil {
-				batchedResponses = append(
-					batchedResponses,
-					&BatchResponse{
-						Status: http.StatusBadRequest,
-						Error:  fmt.Sprintf("failed to convert to event: %s", err.Error()),
-					},
-				)
-				logger.WithField("error", err).Debugf("event from batch failed to process event")
-				continue
-			}
-			batchedResponses = append(
-				batchedResponses,
-				&BatchResponse{Status: http.StatusAccepted},
-			)
-			logger.WithFields(map[string]interface{}{
-				"api_host": ev.APIHost,
-				"dataset":  ev.Dataset,
-			}).Debugf("sending non-trace event from batch")
-			r.UpstreamTransmission.EnqueueEvent(ev)
-			continue
-		}
-		// ok, we're a span. Figure out if we should handle locally or pass on to a peer
-		targetShard := r.Sharder.WhichShard(traceID)
-		if !targetShard.Equals(r.Sharder.MyShard()) {
-			r.Metrics.IncrementCounter(r.incomingOrPeer + "_router_peer")
-			ev, err := r.batchedEventToEvent(req, bev)
-			if err != nil {
-				batchedResponses = append(
-					batchedResponses,
-					&BatchResponse{
-						Status: http.StatusBadRequest,
-						Error:  fmt.Sprintf("failed to process event: %s", err.Error()),
-					},
-				)
-				continue
-			}
-			logger.WithFields(map[string]interface{}{
-				"api_host": ev.APIHost,
-				"dataset":  ev.Dataset,
-				"trace_id": traceID,
-				"peer":     targetShard.GetAddress(),
-			}).Debugf("Sending span from batch to my peer")
-			batchedResponses = append(
-				batchedResponses,
-				&BatchResponse{Status: http.StatusAccepted},
-			)
-			ev.APIHost = targetShard.GetAddress()
-			r.PeerTransmission.EnqueueEvent(ev)
-			continue
-		}
-		// we're supposed to handle it
 		ev, err := r.batchedEventToEvent(req, bev)
 		if err != nil {
 			batchedResponses = append(
 				batchedResponses,
 				&BatchResponse{
 					Status: http.StatusBadRequest,
-					Error:  fmt.Sprintf("failed to process event: %s", err.Error()),
+					Error:  fmt.Sprintf("failed to convert to event: %s", err.Error()),
 				},
 			)
+			debugLog.WithField("error", err).Logf("event from batch failed to process event")
 			continue
 		}
 
-		span := &types.Span{
-			Event:   *ev,
-			TraceID: traceID,
+		err = r.processEvent(ev, reqID)
+
+		var resp BatchResponse
+		switch {
+		case errors.Is(err, collect.ErrWouldBlock):
+			resp.Status = http.StatusTooManyRequests
+			resp.Error = err.Error()
+		case err != nil:
+			resp.Status = http.StatusBadRequest
+			resp.Error = err.Error()
+		default:
+			resp.Status = http.StatusAccepted
 		}
-		r.Metrics.IncrementCounter(r.incomingOrPeer + "_router_span")
-		logger.WithFields(map[string]interface{}{
-			"api_host": ev.APIHost,
-			"dataset":  ev.Dataset,
-			"trace_id": span.TraceID,
-		}).Debugf("Accepting span from batch for collection into a trace")
-		batchedResponses = append(
-			batchedResponses,
-			&BatchResponse{Status: http.StatusAccepted},
-		)
-		if r.incomingOrPeer == "incoming" {
-			r.Collector.AddSpan(span)
-		} else {
-			r.Collector.AddSpanFromPeer(span)
-		}
+		batchedResponses = append(batchedResponses, &resp)
 	}
 	response, err := json.Marshal(batchedResponses)
 	if err != nil {
@@ -432,6 +328,68 @@ func (r *Router) batch(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	w.Write(response)
+}
+
+func (r *Router) processEvent(ev *types.Event, reqID interface{}) error {
+	debugLog := r.iopLogger.Debug().
+		WithField("request_id", reqID).
+		WithString("api_host", ev.APIHost).
+		WithString("dataset", ev.Dataset)
+
+	// extract trace ID, route to self or peer, pass on to collector
+	// TODO make trace ID field configurable
+	var traceID string
+	if trID, ok := ev.Data["trace.trace_id"]; ok {
+		traceID = trID.(string)
+	} else if trID, ok := ev.Data["traceId"]; ok {
+		traceID = trID.(string)
+	}
+	if traceID == "" {
+		// not part of a trace. send along upstream
+		r.Metrics.IncrementCounter(r.incomingOrPeer + "_router_nonspan")
+		debugLog.WithString("api_host", ev.APIHost).
+			WithString("dataset", ev.Dataset).
+			Logf("sending non-trace event from batch")
+		r.UpstreamTransmission.EnqueueEvent(ev)
+		return nil
+	}
+	debugLog = debugLog.WithString("trace_id", traceID)
+
+	// ok, we're a span. Figure out if we should handle locally or pass on to a peer
+	targetShard := r.Sharder.WhichShard(traceID)
+	if r.incomingOrPeer == "incoming" && !targetShard.Equals(r.Sharder.MyShard()) {
+		r.Metrics.IncrementCounter(r.incomingOrPeer + "_router_peer")
+		debugLog.WithString("peer", targetShard.GetAddress()).
+			Logf("Sending span from batch to my peer")
+		ev.APIHost = targetShard.GetAddress()
+
+		// Unfortunately this doesn't tell us if the event was actually
+		// enqueued; we need to watch the response channel to find out, at
+		// which point it's too late to tell the client.
+		r.PeerTransmission.EnqueueEvent(ev)
+		return nil
+	}
+
+	// we're supposed to handle it
+	var err error
+	span := &types.Span{
+		Event:   *ev,
+		TraceID: traceID,
+	}
+	if r.incomingOrPeer == "incoming" {
+		err = r.Collector.AddSpan(span)
+	} else {
+		err = r.Collector.AddSpanFromPeer(span)
+	}
+	if err != nil {
+		r.Metrics.IncrementCounter(r.incomingOrPeer + "_router_dropped")
+		debugLog.Logf("Dropping span from batch, channel full")
+		return err
+	}
+
+	r.Metrics.IncrementCounter(r.incomingOrPeer + "_router_span")
+	debugLog.Logf("Accepting span from batch for collection into a trace")
+	return nil
 }
 
 func (r *Router) getMaybeCompressedBody(req *http.Request) (io.Reader, error) {
@@ -511,7 +469,7 @@ type batchedEvent struct {
 
 func (b *batchedEvent) getEventTime() time.Time {
 	if b.MsgPackTimestamp != nil {
-		return *b.MsgPackTimestamp
+		return b.MsgPackTimestamp.UTC()
 	}
 
 	return getEventTime(b.Timestamp)
@@ -558,7 +516,7 @@ func getEventTime(etHeader string) time.Time {
 			}
 		}
 	}
-	return eventTime
+	return eventTime.UTC()
 }
 
 func makeDecoders(num int) (chan *zstd.Decoder, error) {
@@ -581,21 +539,11 @@ func makeDecoders(num int) (chan *zstd.Decoder, error) {
 func unmarshal(r *http.Request, data io.Reader, v interface{}) error {
 	switch r.Header.Get("Content-Type") {
 	case "application/x-msgpack", "application/msgpack":
-		// First try to decode with the fast but fussy msgp. If that fails,
-		// defer to the much more friendly msgpack.
-		if decodable, ok := v.(msgp.Decodable); ok {
-			err := msgp.Decode(data, decodable)
-
-			if err == nil {
-				return nil
-			}
-		}
-
 		return msgpack.NewDecoder(data).
 			UseDecodeInterfaceLoose(true).
 			Decode(v)
 	case "application/json":
-		return json.NewDecoder(data).Decode(v)
+		return jsoniter.NewDecoder(data).Decode(v)
 	default:
 		return errors.New("Bad Content-Type")
 	}

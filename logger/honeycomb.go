@@ -11,7 +11,7 @@ import (
 	libhoney "github.com/honeycombio/libhoney-go"
 	"github.com/honeycombio/libhoney-go/transmission"
 
-	"github.com/honeycombio/samproxy/config"
+	"github.com/honeycombio/refinery/config"
 )
 
 // HoneycombLogger is a Logger implementation that sends all logs to a Honeycomb
@@ -21,28 +21,18 @@ type HoneycombLogger struct {
 	Config            config.Config   `inject:""`
 	UpstreamTransport *http.Transport `inject:"upstreamTransport"`
 	Version           string          `inject:"version"`
-	loggerConfig      HoneycombLoggerConfig
+	loggerConfig      config.HoneycombLoggerConfig
 	libhClient        *libhoney.Client
 	builder           *libhoney.Builder
 }
 
-type HoneycombLoggerConfig struct {
-	LoggerHoneycombAPI string
-	LoggerAPIKey       string
-	LoggerDataset      string
-
-	level HoneycombLevel
-}
-
 type HoneycombEntry struct {
-	loggerConfig HoneycombLoggerConfig
+	loggerConfig config.HoneycombLoggerConfig
 	builder      *libhoney.Builder
 }
 
-type HoneycombLevel int
-
 const (
-	UnknownLevel HoneycombLevel = iota
+	UnknownLevel config.HoneycombLevel = iota
 	DebugLevel
 	InfoLevel
 	WarnLevel
@@ -55,13 +45,12 @@ func (h *HoneycombLogger) Start() error {
 	// and is set independently, before Start() is called, so we need to
 	// preserve it.
 	// TODO: make LogLevel part of the HoneycombLogger/LogrusLogger sections?
-	logLevel := h.loggerConfig.level
-	loggerConfig := HoneycombLoggerConfig{}
-	err := h.Config.GetOtherConfig("HoneycombLogger", &loggerConfig)
+	logLevel := h.loggerConfig.Level
+	loggerConfig, err := h.Config.GetHoneycombLoggerConfig()
 	if err != nil {
 		return err
 	}
-	loggerConfig.level = logLevel
+	loggerConfig.Level = logLevel
 	h.loggerConfig = loggerConfig
 	var loggerTx transmission.Sender
 	if h.loggerConfig.LoggerAPIKey == "" {
@@ -71,7 +60,7 @@ func (h *HoneycombLogger) Start() error {
 			// logs are often sent in flurries; flush every half second
 			MaxBatchSize:        100,
 			BatchTimeout:        500 * time.Millisecond,
-			UserAgentAddition:   "samproxy/" + h.Version + " (metrics)",
+			UserAgentAddition:   "refinery/" + h.Version + " (metrics)",
 			Transport:           h.UpstreamTransport,
 			PendingWorkCapacity: libhoney.DefaultPendingWorkCapacity,
 		}
@@ -126,19 +115,18 @@ func (h *HoneycombLogger) readResponses() {
 }
 
 func (h *HoneycombLogger) reloadBuilder() {
-	h.Debugf("reloading config for Honeycomb logger")
+	h.Debug().Logf("reloading config for Honeycomb logger")
 	// preseve log level
-	logLevel := h.loggerConfig.level
-	loggerConfig := HoneycombLoggerConfig{}
-	err := h.Config.GetOtherConfig("HoneycombLogger", &loggerConfig)
+	logLevel := h.loggerConfig.Level
+	loggerConfig, err := h.Config.GetHoneycombLoggerConfig()
 	if err != nil {
 		// complain about this both to STDOUT and to the previously configured
 		// honeycomb logger
 		fmt.Printf("failed to reload configs for Honeycomb logger: %+v\n", err)
-		h.Errorf("failed to reload configs for Honeycomb logger: %+v", err)
+		h.Error().Logf("failed to reload configs for Honeycomb logger: %+v", err)
 		return
 	}
-	loggerConfig.level = logLevel
+	loggerConfig.Level = logLevel
 	h.loggerConfig = loggerConfig
 	h.builder.APIHost = h.loggerConfig.LoggerHoneycombAPI
 	h.builder.WriteKey = h.loggerConfig.LoggerAPIKey
@@ -151,69 +139,51 @@ func (h *HoneycombLogger) Stop() error {
 	return nil
 }
 
-func (h *HoneycombLogger) WithField(key string, value interface{}) Entry {
-	entry := &HoneycombEntry{
+func (h *HoneycombLogger) Debug() Entry {
+	if h.loggerConfig.Level > DebugLevel {
+		return nullEntry
+	}
+
+	ev := &HoneycombEntry{
 		loggerConfig: h.loggerConfig,
 		builder:      h.builder.Clone(),
 	}
-	entry.builder.AddField(key, value)
-	return entry
+	ev.builder.AddField("level", "debug")
+
+	return ev
 }
 
-func (h *HoneycombLogger) WithFields(fields map[string]interface{}) Entry {
-	entry := &HoneycombEntry{
+func (h *HoneycombLogger) Info() Entry {
+	if h.loggerConfig.Level > InfoLevel {
+		return nullEntry
+	}
+
+	ev := &HoneycombEntry{
 		loggerConfig: h.loggerConfig,
 		builder:      h.builder.Clone(),
 	}
-	entry.builder.Add(fields)
-	return entry
+	ev.builder.AddField("level", "info")
+
+	return ev
 }
 
-func (h *HoneycombLogger) Debugf(f string, args ...interface{}) {
-	if h.loggerConfig.level > DebugLevel {
-		return
+func (h *HoneycombLogger) Error() Entry {
+	if h.loggerConfig.Level > ErrorLevel {
+		return nullEntry
 	}
-	ev := h.builder.NewEvent()
-	ev.AddField("level", "debug")
-	ev.AddField("msg", fmt.Sprintf(f, args...))
-	ev.Metadata = map[string]string{
-		"api_host": ev.APIHost,
-		"dataset":  ev.Dataset,
-	}
-	ev.Send()
-}
 
-func (h *HoneycombLogger) Infof(f string, args ...interface{}) {
-	if h.loggerConfig.level > InfoLevel {
-		return
+	ev := &HoneycombEntry{
+		loggerConfig: h.loggerConfig,
+		builder:      h.builder.Clone(),
 	}
-	ev := h.builder.NewEvent()
-	ev.AddField("level", "info")
-	ev.AddField("msg", fmt.Sprintf(f, args...))
-	ev.Metadata = map[string]string{
-		"api_host": ev.APIHost,
-		"dataset":  ev.Dataset,
-	}
-	ev.Send()
-}
+	ev.builder.AddField("level", "error")
 
-func (h *HoneycombLogger) Errorf(f string, args ...interface{}) {
-	if h.loggerConfig.level > ErrorLevel {
-		return
-	}
-	ev := h.builder.NewEvent()
-	ev.AddField("level", "error")
-	ev.AddField("msg", fmt.Sprintf(f, args...))
-	ev.Metadata = map[string]string{
-		"api_host": ev.APIHost,
-		"dataset":  ev.Dataset,
-	}
-	ev.Send()
+	return ev
 }
 
 func (h *HoneycombLogger) SetLevel(level string) error {
 	sanitizedLevel := strings.TrimSpace(strings.ToLower(level))
-	var lvl HoneycombLevel
+	var lvl config.HoneycombLevel
 	switch sanitizedLevel {
 	case "debug":
 		lvl = DebugLevel
@@ -228,7 +198,7 @@ func (h *HoneycombLogger) SetLevel(level string) error {
 	default:
 		return errors.New(fmt.Sprintf("unrecognized logging level: %s", level))
 	}
-	h.loggerConfig.level = lvl
+	h.loggerConfig.Level = lvl
 	return nil
 }
 
@@ -237,45 +207,17 @@ func (h *HoneycombEntry) WithField(key string, value interface{}) Entry {
 	return h
 }
 
+func (h *HoneycombEntry) WithString(key string, value string) Entry {
+	return h.WithField(key, value)
+}
+
 func (h *HoneycombEntry) WithFields(fields map[string]interface{}) Entry {
 	h.builder.Add(fields)
 	return h
 }
 
-func (h *HoneycombEntry) Debugf(f string, args ...interface{}) {
-	if h.loggerConfig.level > DebugLevel {
-		return
-	}
+func (h *HoneycombEntry) Logf(f string, args ...interface{}) {
 	ev := h.builder.NewEvent()
-	ev.AddField("level", "debug")
-	ev.AddField("msg", fmt.Sprintf(f, args...))
-	ev.Metadata = map[string]string{
-		"api_host": ev.APIHost,
-		"dataset":  ev.Dataset,
-	}
-	ev.Send()
-}
-
-func (h *HoneycombEntry) Infof(f string, args ...interface{}) {
-	if h.loggerConfig.level > InfoLevel {
-		return
-	}
-	ev := h.builder.NewEvent()
-	ev.AddField("level", "info")
-	ev.AddField("msg", fmt.Sprintf(f, args...))
-	ev.Metadata = map[string]string{
-		"api_host": ev.APIHost,
-		"dataset":  ev.Dataset,
-	}
-	ev.Send()
-}
-
-func (h *HoneycombEntry) Errorf(f string, args ...interface{}) {
-	if h.loggerConfig.level > ErrorLevel {
-		return
-	}
-	ev := h.builder.NewEvent()
-	ev.AddField("level", "error")
 	ev.AddField("msg", fmt.Sprintf(f, args...))
 	ev.Metadata = map[string]string{
 		"api_host": ev.APIHost,

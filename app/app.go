@@ -1,15 +1,11 @@
 package app
 
 import (
-	"os"
-	"os/signal"
-	"syscall"
-
-	"github.com/honeycombio/samproxy/collect"
-	"github.com/honeycombio/samproxy/config"
-	"github.com/honeycombio/samproxy/logger"
-	"github.com/honeycombio/samproxy/metrics"
-	"github.com/honeycombio/samproxy/route"
+	"github.com/honeycombio/refinery/collect"
+	"github.com/honeycombio/refinery/config"
+	"github.com/honeycombio/refinery/logger"
+	"github.com/honeycombio/refinery/metrics"
+	"github.com/honeycombio/refinery/route"
 )
 
 type App struct {
@@ -20,7 +16,7 @@ type App struct {
 	Collector      collect.Collector `inject:""`
 	Metrics        metrics.Metrics   `inject:""`
 
-	// Version is the build ID for samproxy so that the running process may answer
+	// Version is the build ID for Refinery so that the running process may answer
 	// requests for the version
 	Version string
 }
@@ -29,28 +25,20 @@ type App struct {
 // Start exits, Stop will be called on all dependencies then on App then the
 // program will exit.
 func (a *App) Start() error {
-	a.Logger.Debugf("Starting up App...")
-
-	// set up signal channel to exit
-	sigsToExit := make(chan os.Signal, 1)
-	signal.Notify(sigsToExit, syscall.SIGINT, syscall.SIGTERM)
+	a.Logger.Debug().Logf("Starting up App...")
 
 	a.IncomingRouter.SetVersion(a.Version)
 	a.PeerRouter.SetVersion(a.Version)
 
 	// launch our main routers to listen for incoming event traffic from both peers
 	// and external sources
-	go a.IncomingRouter.LnS("incoming")
-	go a.PeerRouter.LnS("peer")
-
-	// block on our signal handler to exit
-	sig := <-sigsToExit
-	a.Logger.Errorf("Caught signal \"%s\"", sig)
+	a.IncomingRouter.LnS("incoming")
+	a.PeerRouter.LnS("peer")
 
 	return nil
 }
 
 func (a *App) Stop() error {
-	a.Logger.Debugf("Shutting down App...")
+	a.Logger.Debug().Logf("Shutting down App...")
 	return nil
 }

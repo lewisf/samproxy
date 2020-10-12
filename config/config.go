@@ -63,20 +63,28 @@ type Config interface {
 	// the logger package
 	GetLoggerType() (string, error)
 
+	// GetHoneycombLoggerConfig returns the config specific to the HoneycombLogger
+	GetHoneycombLoggerConfig() (HoneycombLoggerConfig, error)
+
 	// GetCollectorType returns the type of the collector to use. Valid types
 	// are in the collect package
 	GetCollectorType() (string, error)
 
-	// GetDefaultSamplerType returns the sampler type to use for all datasets
-	// not explicitly defined
-	GetDefaultSamplerType() (string, error)
+	// GetInMemCollectorCacheCapacity returns the config specific to the InMemCollector
+	GetInMemCollectorCacheCapacity() (InMemoryCollectorCacheCapacity, error)
 
-	// GetSamplerTypeForDataset returns the sampler type to use for the given dataset
-	GetSamplerTypeForDataset(string) (string, error)
+	// GetSamplerConfigForDataset returns the sampler type to use for the given dataset
+	GetSamplerConfigForDataset(string) (interface{}, error)
 
 	// GetMetricsType returns the type of metrics to use. Valid types are in the
 	// metrics package
 	GetMetricsType() (string, error)
+
+	// GetHoneycombMetricsConfig returns the config specific to HoneycombMetrics
+	GetHoneycombMetricsConfig() (HoneycombMetricsConfig, error)
+
+	// GetPrometheusMetricsConfig returns the config specific to PrometheusMetrics
+	GetPrometheusMetricsConfig() (PrometheusMetricsConfig, error)
 
 	// GetUpstreamBufferSize returns the size of the libhoney buffer to use for the upstream
 	// libhoney client
@@ -96,5 +104,9 @@ type Config interface {
 
 	// GetDebugServiceAddr sets the IP and port the debug service will run on (you must provide the
 	// command line flag -d to start the debug service)
-	GetDebugServiceAddr() string
+	GetDebugServiceAddr() (string, error)
+
+	GetIsDryRun() bool
+
+	GetDryRunFieldName() string
 }

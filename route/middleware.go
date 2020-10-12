@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
-	"github.com/honeycombio/samproxy/types"
+	"github.com/honeycombio/refinery/types"
 )
 
 // for generating request IDs
@@ -78,7 +78,7 @@ func (r *Router) panicCatcher(next http.Handler) http.Handler {
 	})
 }
 
-// requestLogger logs one line debug per request that comes through samproxy
+// requestLogger logs one line debug per request that comes through Refinery
 func (r *Router) requestLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		arrivalTime := time.Now()
@@ -99,7 +99,7 @@ func (r *Router) requestLogger(next http.Handler) http.Handler {
 		dur := float64(time.Since(arrivalTime)) / float64(time.Millisecond)
 
 		// log that we did so TODO better formatted http log line
-		r.Logger.Debugf("handled %s request %s %s %s %s %f %d", route.GetName(), reqID, remoteIP, method, url, dur, wrapped.status)
+		r.Logger.Debug().Logf("handled %s request %s %s %s %s %f %d", route.GetName(), reqID, remoteIP, method, url, dur, wrapped.status)
 	})
 }
 

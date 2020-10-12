@@ -4,25 +4,26 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/honeycombio/samproxy/config"
+	"github.com/honeycombio/refinery/config"
 )
 
 type Logger interface {
-	WithField(key string, value interface{}) Entry
-	WithFields(fields map[string]interface{}) Entry
-	Debugf(f string, args ...interface{})
-	Infof(f string, args ...interface{})
-	Errorf(f string, args ...interface{})
+	Debug() Entry
+	Info() Entry
+	Error() Entry
 	// SetLevel sets the logging level (debug, info, warn, error)
 	SetLevel(level string) error
 }
 
 type Entry interface {
 	WithField(key string, value interface{}) Entry
+
+	// WithString does the same thing as WithField, but is more efficient for
+	// disabled log levels. (Because the value parameter doesn't escape.)
+	WithString(key string, value string) Entry
+
 	WithFields(fields map[string]interface{}) Entry
-	Debugf(f string, args ...interface{})
-	Infof(f string, args ...interface{})
-	Errorf(f string, args ...interface{})
+	Logf(f string, args ...interface{})
 }
 
 func GetLoggerImplementation(c config.Config) Logger {

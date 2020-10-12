@@ -1,21 +1,20 @@
 package sample
 
 import (
-	"fmt"
 	"math/rand"
 	"sort"
 	"strconv"
 
 	dynsampler "github.com/honeycombio/dynsampler-go"
 
-	"github.com/honeycombio/samproxy/config"
-	"github.com/honeycombio/samproxy/logger"
-	"github.com/honeycombio/samproxy/metrics"
-	"github.com/honeycombio/samproxy/types"
+	"github.com/honeycombio/refinery/config"
+	"github.com/honeycombio/refinery/logger"
+	"github.com/honeycombio/refinery/metrics"
+	"github.com/honeycombio/refinery/types"
 )
 
 type EMADynamicSampler struct {
-	Config  config.Config
+	Config  *config.EMADynamicSamplerConfig
 	Logger  logger.Logger
 	Metrics metrics.Metrics
 
@@ -35,53 +34,28 @@ type EMADynamicSampler struct {
 	dynsampler dynsampler.Sampler
 }
 
-type EMADynSamplerConfig struct {
-	GoalSampleRate      int
-	AdjustmentInterval  int
-	Weight              float64
-	AgeOutValue         float64
-	BurstMultiple       float64
-	BurstDetectionDelay uint
-	MaxKeys             int
-
-	FieldList                    []string
-	UseTraceLength               bool
-	AddSampleRateKeyToTrace      bool
-	AddSampleRateKeyToTraceField string
-}
-
 func (d *EMADynamicSampler) Start() error {
-	d.Logger.Debugf("Starting EMADynamicSampler")
-	defer func() { d.Logger.Debugf("Finished starting EMADynamicSampler") }()
-	dsConfig := EMADynSamplerConfig{}
-	configKey := fmt.Sprintf("SamplerConfig.%s", d.configName)
-	err := d.Config.GetOtherConfig(configKey, &dsConfig)
-	if err != nil {
-		return err
-	}
-	if dsConfig.GoalSampleRate < 1 {
-		d.Logger.Debugf("configured sample rate for dynamic sampler was %d; forcing to 1", dsConfig.GoalSampleRate)
-		dsConfig.GoalSampleRate = 1
-	}
-	d.goalSampleRate = dsConfig.GoalSampleRate
-	d.adjustmentInterval = dsConfig.AdjustmentInterval
-	d.weight = dsConfig.Weight
-	d.ageOutValue = dsConfig.AgeOutValue
-	d.burstMultiple = dsConfig.BurstMultiple
-	d.burstDetectionDelay = dsConfig.BurstDetectionDelay
-	d.maxKeys = dsConfig.MaxKeys
+	d.Logger.Debug().Logf("Starting EMADynamicSampler")
+	defer func() { d.Logger.Debug().Logf("Finished starting EMADynamicSampler") }()
+	d.goalSampleRate = d.Config.GoalSampleRate
+	d.adjustmentInterval = d.Config.AdjustmentInterval
+	d.weight = d.Config.Weight
+	d.ageOutValue = d.Config.AgeOutValue
+	d.burstMultiple = d.Config.BurstMultiple
+	d.burstDetectionDelay = d.Config.BurstDetectionDelay
+	d.maxKeys = d.Config.MaxKeys
 
 	// get list of fields to use when constructing the dynsampler key
-	fieldList := dsConfig.FieldList
+	fieldList := d.Config.FieldList
 
 	// always put the field list in sorted order for easier comparison
 	sort.Strings(fieldList)
 	d.fieldList = fieldList
 
-	d.useTraceLength = dsConfig.UseTraceLength
+	d.useTraceLength = d.Config.UseTraceLength
 
-	d.addDynsampleKey = dsConfig.AddSampleRateKeyToTrace
-	d.addDynsampleField = dsConfig.AddSampleRateKeyToTraceField
+	d.addDynsampleKey = d.Config.AddSampleRateKeyToTrace
+	d.addDynsampleField = d.Config.AddSampleRateKeyToTraceField
 
 	// spin up the actual dynamic sampler
 	d.dynsampler = &dynsampler.EMASampleRate{
@@ -100,105 +74,7 @@ func (d *EMADynamicSampler) Start() error {
 	d.Metrics.Register("dynsampler_num_kept", "counter")
 	d.Metrics.Register("dynsampler_sample_rate", "histogram")
 
-	// listen for config reloads
-	d.Config.RegisterReloadCallback(d.reloadConfigs)
 	return nil
-}
-
-func (d *EMADynamicSampler) reloadConfigs() {
-	d.Logger.Debugf("reloading config for dynamic sampler")
-	// only actually reload the dynsampler if the config changed.
-	var configChanged bool
-
-	dsConfig := EMADynSamplerConfig{}
-	configKey := fmt.Sprintf("SamplerConfig.%s", d.configName)
-	err := d.Config.GetOtherConfig(configKey, &dsConfig)
-	if err != nil {
-		d.Logger.Errorf("Failed to get dynsampler settings when reloading configs:", err)
-	}
-	if dsConfig.GoalSampleRate < 1 {
-		d.Logger.Debugf("configured sample rate for dynamic sampler was %d; forcing to 1", dsConfig.GoalSampleRate)
-		dsConfig.GoalSampleRate = 1
-	}
-	if d.goalSampleRate != dsConfig.GoalSampleRate {
-		configChanged = true
-		d.goalSampleRate = dsConfig.GoalSampleRate
-	}
-	if d.adjustmentInterval != dsConfig.AdjustmentInterval {
-		configChanged = true
-		d.adjustmentInterval = dsConfig.AdjustmentInterval
-	}
-	if d.weight != dsConfig.Weight {
-		configChanged = true
-		d.weight = dsConfig.Weight
-	}
-	if d.maxKeys != dsConfig.MaxKeys {
-		configChanged = true
-		d.maxKeys = dsConfig.MaxKeys
-	}
-	if d.burstMultiple != dsConfig.BurstMultiple {
-		configChanged = true
-		d.burstMultiple = dsConfig.BurstMultiple
-	}
-	if d.burstDetectionDelay != dsConfig.BurstDetectionDelay {
-		configChanged = true
-		d.burstDetectionDelay = dsConfig.BurstDetectionDelay
-	}
-	if d.ageOutValue != dsConfig.AgeOutValue {
-		configChanged = true
-		d.ageOutValue = dsConfig.AgeOutValue
-	}
-
-	// get list of fields to use when constructing the dynsampler key
-	fieldList := dsConfig.FieldList
-	sort.Strings(fieldList)
-	// find out if the field list changed by checking that length is the same
-	// and if it is that the sorted list of fields are the same
-	if len(d.fieldList) != len(fieldList) {
-		configChanged = true
-		d.fieldList = fieldList
-	} else {
-		for i, field := range fieldList {
-			if d.fieldList[i] != field {
-				configChanged = true
-				d.fieldList = fieldList
-				break
-			}
-		}
-	}
-
-	if d.useTraceLength != dsConfig.UseTraceLength {
-		configChanged = true
-		d.useTraceLength = dsConfig.UseTraceLength
-	}
-
-	if d.addDynsampleKey != dsConfig.AddSampleRateKeyToTrace {
-		configChanged = true
-		d.addDynsampleKey = dsConfig.AddSampleRateKeyToTrace
-	}
-	if d.addDynsampleField != dsConfig.AddSampleRateKeyToTraceField {
-		configChanged = true
-		d.addDynsampleField = dsConfig.AddSampleRateKeyToTraceField
-	}
-
-	if configChanged {
-		newSampler := &dynsampler.EMASampleRate{
-			GoalSampleRate:      d.goalSampleRate,
-			AdjustmentInterval:  d.adjustmentInterval,
-			Weight:              d.weight,
-			AgeOutValue:         d.ageOutValue,
-			BurstDetectionDelay: d.burstDetectionDelay,
-			BurstMultiple:       d.burstMultiple,
-			MaxKeys:             d.maxKeys,
-		}
-		newSampler.Start()
-
-		d.Logger.Debugf("reloaded dynsampler configs with values %+v", dsConfig)
-
-		d.dynsampler = newSampler
-	} else {
-		d.Logger.Debugf("skipping dynsampler reload because the config of %+v is unchanged from the previous state", dsConfig)
-	}
 }
 
 func (d *EMADynamicSampler) GetSampleRate(trace *types.Trace) (uint, bool) {
@@ -208,12 +84,12 @@ func (d *EMADynamicSampler) GetSampleRate(trace *types.Trace) (uint, bool) {
 		rate = 1
 	}
 	shouldKeep := rand.Intn(int(rate)) == 0
-	d.Logger.WithFields(map[string]interface{}{
+	d.Logger.Debug().WithFields(map[string]interface{}{
 		"sample_key":  key,
 		"sample_rate": rate,
 		"sample_keep": shouldKeep,
 		"trace_id":    trace.TraceID,
-	}).Debugf("got sample rate and decision")
+	}).Logf("got sample rate and decision")
 	if shouldKeep {
 		d.Metrics.IncrementCounter("dynsampler_num_kept")
 	} else {

@@ -1,9 +1,11 @@
 package cache
 
 import (
-	"github.com/honeycombio/samproxy/logger"
-	"github.com/honeycombio/samproxy/metrics"
-	"github.com/honeycombio/samproxy/types"
+	"time"
+
+	"github.com/honeycombio/refinery/logger"
+	"github.com/honeycombio/refinery/metrics"
+	"github.com/honeycombio/refinery/types"
 )
 
 // Cache is a non-threadsafe cache. It must not be used for concurrent access.
@@ -14,6 +16,10 @@ type Cache interface {
 	Get(traceID string) *types.Trace
 	// GetAll is used during shutdown to get all in-flight traces to flush them
 	GetAll() []*types.Trace
+
+	// Retrieve and remove all traces which are past their SendBy date.
+	// Does not check whether they've been sent.
+	TakeExpiredTraces(now time.Time) []*types.Trace
 }
 
 // DefaultInMemCache keeps a bounded number of entries to avoid growing memory
@@ -21,7 +27,6 @@ type Cache interface {
 // order) so it is important to have a cache larger than trace throughput *
 // longest trace.
 type DefaultInMemCache struct {
-	Config  CacheConfig
 	Metrics metrics.Metrics
 	Logger  logger.Logger
 
@@ -33,32 +38,37 @@ type DefaultInMemCache struct {
 	insertPoint int
 }
 
-type CacheConfig struct {
-	CacheCapacity int
-}
-
 const DefaultInMemCacheCapacity = 10000
 
-func (d *DefaultInMemCache) Start() error {
-	d.Logger.Debugf("Starting DefaultInMemCache")
-	defer func() { d.Logger.Debugf("Finished starting DefaultInMemCache") }()
-	if d.Config.CacheCapacity == 0 {
-		d.Config.CacheCapacity = DefaultInMemCacheCapacity
-	}
-	d.cache = make(map[string]*types.Trace, d.Config.CacheCapacity)
-	d.insertionOrder = make([]*types.Trace, d.Config.CacheCapacity)
-
-	// register statistics sent by this module
+func NewInMemCache(
+	capacity int,
+	metrics metrics.Metrics,
+	logger logger.Logger,
+) *DefaultInMemCache {
+	logger.Debug().Logf("Starting DefaultInMemCache")
+	defer func() { logger.Debug().Logf("Finished starting DefaultInMemCache") }()
 
 	// buffer_overrun increments when the trace overwritten in the circular
 	// buffer has not yet been sent
-	d.Metrics.Register("collect_cache_buffer_overrun", "counter")
+	metrics.Register("collect_cache_buffer_overrun", "counter")
+	metrics.Register("collect_cache_capacity", "gauge")
+	metrics.Register("collect_cache_entries", "histogram")
 
-	return nil
+	if capacity == 0 {
+		capacity = DefaultInMemCacheCapacity
+	}
+
+	return &DefaultInMemCache{
+		Metrics:        metrics,
+		Logger:         logger,
+		cache:          make(map[string]*types.Trace, capacity),
+		insertionOrder: make([]*types.Trace, capacity),
+	}
+
 }
 
 func (d *DefaultInMemCache) GetCacheSize() int {
-	return d.Config.CacheCapacity
+	return len(d.insertionOrder)
 }
 
 // Set adds the trace to the ring. If it is kicking out a trace from the ring
@@ -78,7 +88,7 @@ func (d *DefaultInMemCache) Set(trace *types.Trace) *types.Trace {
 	defer func() { d.insertPoint++ }()
 
 	// loop insert point when we get to the end of the ring
-	if d.insertPoint >= d.Config.CacheCapacity {
+	if d.insertPoint >= len(d.insertionOrder) {
 		d.insertPoint = 0
 	}
 
@@ -89,7 +99,7 @@ func (d *DefaultInMemCache) Set(trace *types.Trace) *types.Trace {
 	oldTrace := d.insertionOrder[d.insertPoint]
 	if oldTrace != nil {
 		delete(d.cache, oldTrace.TraceID)
-		if !oldTrace.GetSent() {
+		if !oldTrace.Sent {
 			// if it hasn't already been sent,
 			// record that we're overrunning the buffer
 			d.Metrics.IncrementCounter("collect_cache_buffer_overrun")
@@ -107,10 +117,28 @@ func (d *DefaultInMemCache) Get(traceID string) *types.Trace {
 }
 
 // GetAll is not thread safe and should only be used when that's ok
+// Returns all non-nil trace entries.
 func (d *DefaultInMemCache) GetAll() []*types.Trace {
-	// make a copy so it doesn't get modified for the poor soul trying to use
-	// this list after it's returned
-	tmp := make([]*types.Trace, len(d.insertionOrder))
-	copy(tmp, d.insertionOrder)
+	tmp := make([]*types.Trace, 0, len(d.insertionOrder))
+	for _, t := range d.insertionOrder {
+		if t != nil {
+			tmp = append(tmp, t)
+		}
+	}
 	return tmp
+}
+
+func (d *DefaultInMemCache) TakeExpiredTraces(now time.Time) []*types.Trace {
+	d.Metrics.Gauge("collect_cache_capacity", float64(len(d.insertionOrder)))
+	d.Metrics.Histogram("collect_cache_entries", float64(len(d.cache)))
+
+	var res []*types.Trace
+	for i, t := range d.insertionOrder {
+		if t != nil && now.After(t.SendBy) {
+			res = append(res, t)
+			d.insertionOrder[i] = nil
+			delete(d.cache, t.TraceID)
+		}
+	}
+	return res
 }

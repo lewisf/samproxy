@@ -9,8 +9,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"github.com/honeycombio/samproxy/config"
-	"github.com/honeycombio/samproxy/logger"
+	"github.com/honeycombio/refinery/config"
+	"github.com/honeycombio/refinery/logger"
 )
 
 type PromMetrics struct {
@@ -22,15 +22,10 @@ type PromMetrics struct {
 	lock    sync.Mutex
 }
 
-type PromConfig struct {
-	MetricsListenAddr string
-}
-
 func (p *PromMetrics) Start() error {
-	p.Logger.Debugf("Starting PromMetrics")
-	defer func() { p.Logger.Debugf("Finished starting PromMetrics") }()
-	pc := PromConfig{}
-	err := p.Config.GetOtherConfig("PrometheusMetrics", &pc)
+	p.Logger.Debug().Logf("Starting PromMetrics")
+	defer func() { p.Logger.Debug().Logf("Finished starting PromMetrics") }()
+	pc, err := p.Config.GetPrometheusMetricsConfig()
 	if err != nil {
 		return err
 	}

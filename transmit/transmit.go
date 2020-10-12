@@ -2,13 +2,15 @@ package transmit
 
 import (
 	"context"
+	"sync"
 
 	libhoney "github.com/honeycombio/libhoney-go"
+	"github.com/honeycombio/libhoney-go/transmission"
 
-	"github.com/honeycombio/samproxy/config"
-	"github.com/honeycombio/samproxy/logger"
-	"github.com/honeycombio/samproxy/metrics"
-	"github.com/honeycombio/samproxy/types"
+	"github.com/honeycombio/refinery/config"
+	"github.com/honeycombio/refinery/logger"
+	"github.com/honeycombio/refinery/metrics"
+	"github.com/honeycombio/refinery/types"
 )
 
 type Transmission interface {
@@ -40,9 +42,11 @@ type DefaultTransmission struct {
 	responseCanceler context.CancelFunc
 }
 
+var once sync.Once
+
 func (d *DefaultTransmission) Start() error {
-	d.Logger.Debugf("Starting DefaultTransmission: %s type", d.Name)
-	defer func() { d.Logger.Debugf("Finished starting DefaultTransmission: %s type", d.Name) }()
+	d.Logger.Debug().Logf("Starting DefaultTransmission: %s type", d.Name)
+	defer func() { d.Logger.Debug().Logf("Finished starting DefaultTransmission: %s type", d.Name) }()
 
 	// upstreamAPI doesn't get set when the client is initialized, because
 	// it can be reloaded from the config file while live
@@ -50,9 +54,12 @@ func (d *DefaultTransmission) Start() error {
 	if err != nil {
 		return err
 	}
-	libhoney.UserAgentAddition = "samproxy/" + d.Version
 	d.builder = d.LibhClient.NewBuilder()
 	d.builder.APIHost = upstreamAPI
+
+	once.Do(func() {
+		libhoney.UserAgentAddition = "refinery/" + d.Version
+	})
 
 	d.Metrics.Register(d.Name+counterEnqueueErrors, "counter")
 	d.Metrics.Register(d.Name+counterResponse20x, "counter")
@@ -61,7 +68,7 @@ func (d *DefaultTransmission) Start() error {
 
 	processCtx, canceler := context.WithCancel(context.Background())
 	d.responseCanceler = canceler
-	go d.processResponses(processCtx)
+	go d.processResponses(processCtx, d.LibhClient.TxResponses())
 
 	// listen for config reloads
 	d.Config.RegisterReloadCallback(d.reloadTransmissionBuilder)
@@ -69,36 +76,28 @@ func (d *DefaultTransmission) Start() error {
 }
 
 func (d *DefaultTransmission) reloadTransmissionBuilder() {
-	d.Logger.Debugf("reloading transmission config")
+	d.Logger.Debug().Logf("reloading transmission config")
 	upstreamAPI, err := d.Config.GetHoneycombAPI()
 	if err != nil {
 		// log and skip reload
-		d.Logger.Errorf("Failed to reload Honeycomb API when reloading configs:", err)
+		d.Logger.Error().Logf("Failed to reload Honeycomb API when reloading configs:", err)
 	}
 	builder := d.LibhClient.NewBuilder()
 	builder.APIHost = upstreamAPI
 }
 
 func (d *DefaultTransmission) EnqueueEvent(ev *types.Event) {
-	d.Logger.WithFields(map[string]interface{}{
-		"request_id": ev.Context.Value(types.RequestIDContextKey{}),
-		"api_host":   ev.APIHost,
-		"dataset":    ev.Dataset,
-		"type":       ev.Type,
-		"target":     ev.Target,
-	}).Debugf("transmit sending event")
+	d.Logger.Debug().
+		WithField("request_id", ev.Context.Value(types.RequestIDContextKey{})).
+		WithString("api_host", ev.APIHost).
+		WithString("dataset", ev.Dataset).
+		Logf("transmit sending event")
 	libhEv := d.builder.NewEvent()
 	libhEv.APIHost = ev.APIHost
 	libhEv.WriteKey = ev.APIKey
 	libhEv.Dataset = ev.Dataset
 	libhEv.SampleRate = ev.SampleRate
 	libhEv.Timestamp = ev.Timestamp
-	libhEv.Metadata = map[string]string{
-		"type":     ev.Type.String(),
-		"target":   ev.Target.String(),
-		"api_host": ev.APIHost,
-		"dataset":  ev.Dataset,
-	}
 
 	for k, v := range ev.Data {
 		libhEv.AddField(k, v)
@@ -107,14 +106,12 @@ func (d *DefaultTransmission) EnqueueEvent(ev *types.Event) {
 	err := libhEv.SendPresampled()
 	if err != nil {
 		d.Metrics.IncrementCounter(d.Name + counterEnqueueErrors)
-		d.Logger.WithFields(map[string]interface{}{
-			"error":      err.Error(),
-			"request_id": ev.Context.Value(types.RequestIDContextKey{}),
-			"dataset":    ev.Dataset,
-			"api_host":   ev.APIHost,
-			"type":       ev.Type.String(),
-			"target":     ev.Target.String(),
-		}).Errorf("failed to enqueue event")
+		d.Logger.Error().
+			WithString("error", err.Error()).
+			WithField("request_id", ev.Context.Value(types.RequestIDContextKey{})).
+			WithString("dataset", ev.Dataset).
+			WithString("api_host", ev.APIHost).
+			Logf("failed to enqueue event")
 	}
 }
 
@@ -137,9 +134,11 @@ func (d *DefaultTransmission) Stop() error {
 	return nil
 }
 
-func (d *DefaultTransmission) processResponses(ctx context.Context) {
+func (d *DefaultTransmission) processResponses(
+	ctx context.Context,
+	responses chan transmission.Response,
+) {
 	honeycombAPI, _ := d.Config.GetHoneycombAPI()
-	responses := d.LibhClient.TxResponses()
 	for {
 		select {
 		case r := <-responses:
@@ -151,7 +150,7 @@ func (d *DefaultTransmission) processResponses(ctx context.Context) {
 					evType = metadata["type"]
 					target = metadata["target"]
 				}
-				log := d.Logger.WithFields(map[string]interface{}{
+				log := d.Logger.Error().WithFields(map[string]interface{}{
 					"status_code": r.StatusCode,
 					"api_host":    apiHost,
 					"dataset":     dataset,
@@ -161,7 +160,7 @@ func (d *DefaultTransmission) processResponses(ctx context.Context) {
 				if r.Err != nil {
 					log = log.WithField("error", r.Err.Error())
 				}
-				log.Errorf("non-20x response when sending event")
+				log.Logf("non-20x response when sending event")
 				if honeycombAPI == apiHost {
 					// if the API host matches the configured honeycomb API,
 					// count it as an API error

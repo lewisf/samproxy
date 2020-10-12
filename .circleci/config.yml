@@ -8,7 +8,7 @@ executors:
   linuxgo:
     parameters:
     docker:
-      - image: cimg/go:1.14
+      - image: cimg/go:1.15
       - image: redis:6
 
 commands:
@@ -29,8 +29,8 @@ commands:
           GOOS=<< parameters.os >> \
           GOARCH=<< parameters.arch >> \
           go build -ldflags "-X main.BuildID=${CIRCLE_TAG:-${CIRCLE_SHA1:0:7}}" \
-          -o $GOPATH/bin/samproxy-<< parameters.os >>-<< parameters.arch >> \
-          ./cmd/samproxy
+          -o $GOPATH/bin/refinery-<< parameters.os >>-<< parameters.arch >> \
+          ./cmd/refinery
 
 jobs:
   test:
@@ -46,8 +46,11 @@ jobs:
            name: Wait for redis
            command: dockerize -wait tcp://localhost:6379 -timeout 1m
       - run:
+          name: go_test with race
+          command: go test -tags race --race --timeout 60s -v ./...
+      - run:
           name: go_test
-          command: go test --timeout 10s -v ./...
+          command: go test -tags all --timeout 60s -v ./...
 
   build:
     executor: linuxgo
@@ -83,7 +86,7 @@ jobs:
           command: ./build-pkg.sh -m amd64 -v "${CIRCLE_TAG:-${CIRCLE_SHA1:0:7}}" -t rpm && mv *.rpm ~/artifacts
       - run:
           name: copy_binaries
-          command: cp $GOPATH/bin/samproxy-* ~/artifacts
+          command: cp $GOPATH/bin/refinery-* ~/artifacts
       - run: echo "finished builds" && find ~/artifacts -ls
       - persist_to_workspace:
           root: ~/
@@ -116,7 +119,10 @@ jobs:
           aws-region: AWS_REGION
       - run:
           name: sync_s3_artifacts
-          command: aws s3 sync ~/artifacts s3://honeycomb-builds/honeycombio/samproxy/${CIRCLE_TAG:-${CIRCLE_SHA1:0:7}}/
+          command: |
+            version=${CIRCLE_TAG:1}
+            if [[ -z "$version" ]] ; then version=${CIRCLE_SHA1:0:7}; fi
+            aws s3 sync ~/artifacts s3://honeycomb-builds/honeycombio/refinery/$version/
 
 workflows:
   build:
@@ -147,6 +153,15 @@ workflows:
           filters:
             tags:
               only: /.*/
+      - docker/publish:
+          tag: latest
+          extra_build_args: --build-arg BUILD_ID=${CIRCLE_SHA1:0:7}
+          image: $CIRCLE_PROJECT_USERNAME/$CIRCLE_PROJECT_REPONAME
+          requires:
+            - build
+          filters:
+            branches:
+              only: main
       - docker/publish:
           tag: latest,${CIRCLE_TAG:1}
           extra_build_args: --build-arg BUILD_ID=${CIRCLE_TAG:1}

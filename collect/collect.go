@@ -3,26 +3,30 @@ package collect
 import (
 	"errors"
 	"fmt"
-	"math"
 	"os"
+	"runtime"
+	"sort"
+	"sync"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru"
-	"github.com/honeycombio/samproxy/collect/cache"
-	"github.com/honeycombio/samproxy/config"
-	"github.com/honeycombio/samproxy/logger"
-	"github.com/honeycombio/samproxy/metrics"
-	"github.com/honeycombio/samproxy/sample"
-	"github.com/honeycombio/samproxy/transmit"
-	"github.com/honeycombio/samproxy/types"
+	"github.com/honeycombio/refinery/collect/cache"
+	"github.com/honeycombio/refinery/config"
+	"github.com/honeycombio/refinery/logger"
+	"github.com/honeycombio/refinery/metrics"
+	"github.com/honeycombio/refinery/sample"
+	"github.com/honeycombio/refinery/transmit"
+	"github.com/honeycombio/refinery/types"
 )
+
+var ErrWouldBlock = errors.New("not adding span, channel buffer is full")
 
 type Collector interface {
 	// AddSpan adds a span to be collected, buffered, and merged in to a trace.
 	// Once the trace is "complete", it'll be passed off to the sampler then
 	// scheduled for transmission.
-	AddSpan(*types.Span)
-	AddSpanFromPeer(*types.Span)
+	AddSpan(*types.Span) error
+	AddSpanFromPeer(*types.Span) error
 }
 
 func GetCollectorImplementation(c config.Config) Collector {
@@ -50,19 +54,21 @@ type InMemCollector struct {
 	Metrics        metrics.Metrics        `inject:""`
 	SamplerFactory *sample.SamplerFactory `inject:""`
 
-	Cache           cache.Cache
+	// For test use only
+	BlockOnAddSpan bool
+
+	// mutex must be held whenever non-channel internal fields are accessed.
+	// This exists to avoid data races in tests and startup/shutdown.
+	mutex sync.RWMutex
+
+	cache           cache.Cache
 	datasetSamplers map[string]sample.Sampler
-	defaultSampler  sample.Sampler
 
 	sentTraceCache *lru.Cache
 
 	incoming chan *types.Span
 	fromPeer chan *types.Span
 	reload   chan struct{}
-}
-
-type imcConfig struct {
-	CacheCapacity int
 }
 
 // traceSentRecord is the bit we leave behind when sending a trace to remember
@@ -74,27 +80,13 @@ type traceSentRecord struct {
 }
 
 func (i *InMemCollector) Start() error {
-	i.Logger.Debugf("Starting InMemCollector")
-	defer func() { i.Logger.Debugf("Finished starting InMemCollector") }()
-	i.defaultSampler = i.SamplerFactory.GetDefaultSamplerImplementation()
-	imcConfig := &imcConfig{}
-	err := i.Config.GetOtherConfig("InMemCollector", imcConfig)
+	i.Logger.Debug().Logf("Starting InMemCollector")
+	defer func() { i.Logger.Debug().Logf("Finished starting InMemCollector") }()
+	imcConfig, err := i.Config.GetInMemCollectorCacheCapacity()
 	if err != nil {
 		return err
 	}
-	capacity := imcConfig.CacheCapacity
-	if capacity > math.MaxInt32 {
-		return errors.New(fmt.Sprintf("maximum cache capacity is %d", math.MaxInt32))
-	}
-	c := &cache.DefaultInMemCache{
-		Config: cache.CacheConfig{
-			CacheCapacity: capacity,
-		},
-		Metrics: i.Metrics,
-		Logger:  i.Logger,
-	}
-	c.Start()
-	i.Cache = c
+	i.cache = cache.NewInMemCache(imcConfig.CacheCapacity, i.Metrics, i.Logger)
 
 	// listen for config reloads
 	i.Config.RegisterReloadCallback(i.sendReloadSignal)
@@ -108,17 +100,19 @@ func (i *InMemCollector) Start() error {
 	i.Metrics.Register("trace_accepted", "counter")
 	i.Metrics.Register("trace_send_kept", "counter")
 	i.Metrics.Register("trace_send_dropped", "counter")
-	i.Metrics.Register("peer_queue_too_large", "counter")
+	i.Metrics.Register("trace_send_has_root", "counter")
+	i.Metrics.Register("trace_send_no_root", "counter")
 
-	stc, err := lru.New(capacity * 5) // keep 5x ring buffer size
+	stc, err := lru.New(imcConfig.CacheCapacity * 5) // keep 5x ring buffer size
 	if err != nil {
 		return err
 	}
 	i.sentTraceCache = stc
 
-	i.incoming = make(chan *types.Span, capacity*3)
-	i.fromPeer = make(chan *types.Span, capacity*3)
+	i.incoming = make(chan *types.Span, imcConfig.CacheCapacity*3)
+	i.fromPeer = make(chan *types.Span, imcConfig.CacheCapacity*3)
 	i.reload = make(chan struct{}, 1)
+	i.datasetSamplers = make(map[string]sample.Sampler)
 	// spin up one collector because this is a single threaded collector
 	go i.collect()
 
@@ -130,58 +124,121 @@ func (i *InMemCollector) sendReloadSignal() {
 	// non-blocking insert of the signal here so we don't leak goroutines
 	select {
 	case i.reload <- struct{}{}:
-		i.Logger.Debugf("sending collect reload signal")
+		i.Logger.Debug().Logf("sending collect reload signal")
 	default:
-		i.Logger.Debugf("collect already waiting to reload; skipping additional signal")
+		i.Logger.Debug().Logf("collect already waiting to reload; skipping additional signal")
 	}
 }
 
 func (i *InMemCollector) reloadConfigs() {
-	i.Logger.Debugf("reloading in-mem collect config")
-	imcConfig := &imcConfig{}
-	err := i.Config.GetOtherConfig("InMemCollector", imcConfig)
+	i.Logger.Debug().Logf("reloading in-mem collect config")
+	imcConfig, err := i.Config.GetInMemCollectorCacheCapacity()
 	if err != nil {
-		i.Logger.WithField("error", err).Errorf("Failed to reload InMemCollector section when reloading configs")
+		i.Logger.Error().WithField("error", err).Logf("Failed to reload InMemCollector section when reloading configs")
 	}
-	capacity := imcConfig.CacheCapacity
 
-	if existingCache, ok := i.Cache.(*cache.DefaultInMemCache); ok {
-		if capacity != existingCache.GetCacheSize() {
-			i.Logger.WithField("cache_size.previous", existingCache.GetCacheSize()).WithField("cache_size.new", capacity).Debugf("refreshing the cache because it changed size")
-			c := &cache.DefaultInMemCache{
-				Config: cache.CacheConfig{
-					CacheCapacity: capacity,
-				},
-				Metrics: i.Metrics,
-			}
-			c.Start()
+	if existingCache, ok := i.cache.(*cache.DefaultInMemCache); ok {
+		if imcConfig.CacheCapacity != existingCache.GetCacheSize() {
+			i.Logger.Debug().WithField("cache_size.previous", existingCache.GetCacheSize()).WithField("cache_size.new", imcConfig.CacheCapacity).Logf("refreshing the cache because it changed size")
+			c := cache.NewInMemCache(imcConfig.CacheCapacity, i.Metrics, i.Logger)
 			// pull the old cache contents into the new cache
-			for i, trace := range existingCache.GetAll() {
-				if i > capacity {
-					break
+			for j, trace := range existingCache.GetAll() {
+				if j >= imcConfig.CacheCapacity {
+					i.send(trace)
+					continue
 				}
 				c.Set(trace)
 			}
-			i.Cache = c
+			i.cache = c
 		} else {
-			i.Logger.Debugf("skipping reloading the cache on config reload because it hasn't changed capacity")
+			i.Logger.Debug().Logf("skipping reloading the cache on config reload because it hasn't changed capacity")
 		}
 	} else {
-		i.Logger.WithField("cache", i.Cache.(*cache.DefaultInMemCache)).Errorf("skipping reloading the cache on config reload because it's not an in-memory cache")
+		i.Logger.Error().WithField("cache", i.cache.(*cache.DefaultInMemCache)).Logf("skipping reloading the cache on config reload because it's not an in-memory cache")
 	}
+
+	// clear out any samplers that we have previously created
+	// so that the new configuration will be propagated
+	i.datasetSamplers = make(map[string]sample.Sampler)
 	// TODO add resizing the LRU sent trace cache on config reload
 }
 
-// AddSpan accepts the incoming span to a queue and returns immediately
-func (i *InMemCollector) AddSpan(sp *types.Span) {
-	// TODO protect against sending on a closed channel during shutdown
-	i.incoming <- sp
+func (i *InMemCollector) checkAlloc() {
+	inMemConfig, err := i.Config.GetInMemCollectorCacheCapacity()
+
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+	if err != nil || inMemConfig.MaxAlloc == 0 || mem.Alloc < inMemConfig.MaxAlloc {
+		return
+	}
+
+	existingCache, ok := i.cache.(*cache.DefaultInMemCache)
+	if !ok || existingCache.GetCacheSize() < 100 {
+		i.Logger.Error().WithField("alloc", mem.Alloc).Logf(
+			"total allocation exceeds limit, but unable to shrink cache",
+		)
+		return
+	}
+
+	// Reduce cache size by a fixed 10%, successive overages will continue to shrink.
+	// Base this on the total number of actual traces, which may be fewer than
+	// the cache capacity.
+	oldCap := existingCache.GetCacheSize()
+	oldTraces := existingCache.GetAll()
+	newCap := int(float64(len(oldTraces)) * 0.9)
+
+	// Treat any MaxAlloc overage as an error. The configured cache capacity
+	// should be reduced to avoid this condition.
+	i.Logger.Error().
+		WithField("cache_size.previous", oldCap).
+		WithField("cache_size.new", newCap).
+		WithField("alloc", mem.Alloc).
+		Logf("reducing cache size due to memory overage")
+
+	c := cache.NewInMemCache(newCap, i.Metrics, i.Logger)
+
+	// Sort traces by deadline, oldest first.
+	sort.Slice(oldTraces, func(i, j int) bool {
+		return oldTraces[i].SendBy.Before(oldTraces[j].SendBy)
+	})
+
+	// Send the traces we can't keep, put the rest into the new cache.
+	for _, trace := range oldTraces[:len(oldTraces)-newCap] {
+		i.send(trace)
+	}
+	for _, trace := range oldTraces[len(oldTraces)-newCap:] {
+		c.Set(trace)
+	}
+	i.cache = c
+
+	// Manually GC here - it's unfortunate to block this long, but without
+	// this we can easily end up shrinking more than we need to, since total
+	// alloc won't be updated until after a GC pass.
+	runtime.GC()
 }
 
 // AddSpan accepts the incoming span to a queue and returns immediately
-func (i *InMemCollector) AddSpanFromPeer(sp *types.Span) {
-	// TODO protect against sending on a closed channel during shutdown
-	i.fromPeer <- sp
+func (i *InMemCollector) AddSpan(sp *types.Span) error {
+	return i.add(sp, i.incoming)
+}
+
+// AddSpan accepts the incoming span to a queue and returns immediately
+func (i *InMemCollector) AddSpanFromPeer(sp *types.Span) error {
+	return i.add(sp, i.fromPeer)
+}
+
+func (i *InMemCollector) add(sp *types.Span, ch chan<- *types.Span) error {
+	if i.BlockOnAddSpan {
+		ch <- sp
+		return nil
+	}
+
+	select {
+	case ch <- sp:
+		return nil
+	default:
+		return ErrWouldBlock
+	}
 }
 
 // collect handles both accepting spans that have been handed to it and sending
@@ -194,82 +251,69 @@ func (i *InMemCollector) collect() {
 	ticker := time.NewTicker(tickerDuration)
 	defer ticker.Stop()
 
-	peerChanSize := cap(i.fromPeer)
+	// mutex is normally held by this goroutine at all times.
+	// It is unlocked once per ticker cycle for tests.
+	i.mutex.Lock()
+	defer i.mutex.Unlock()
 
 	for {
 		// record channel lengths
 		i.Metrics.Histogram("collector_incoming_queue", float64(len(i.incoming)))
 		i.Metrics.Histogram("collector_peer_queue", float64(len(i.fromPeer)))
 
-		select {
-		case <-ticker.C:
-			i.sendTracesInCache(time.Now())
-		default:
-		}
-
-		// process peer traffic at 2/1 ratio to incoming traffic. By processing peer
+		// Always drain peer channel before doing anyhting else. By processing peer
 		// traffic preferentially we avoid the situation where the cluster essentially
 		// deadlocks because peers are waiting to get their events handed off to each
 		// other.
 		select {
-		case <-ticker.C:
-			i.sendTracesInCache(time.Now())
 		case sp, ok := <-i.fromPeer:
 			if !ok {
 				// channel's been closed; we should shut down.
 				return
 			}
 			i.processSpan(sp)
-			// additionally, if the peer channel is more than 80% full, restart this
-			// loop to make sure it stays empty enough. We _really_ want to avoid
-			// blocking peer traffic.
-			if len(i.fromPeer)*100/peerChanSize > 80 {
-				i.Metrics.IncrementCounter("peer_queue_too_large")
-				continue
-			}
 		default:
-		}
+			select {
+			case <-ticker.C:
+				i.sendTracesInCache(time.Now())
+				i.checkAlloc()
 
-		// ok, the peer queue is low enough, let's wait for new events from anywhere
-		select {
-		case <-ticker.C:
-			i.sendTracesInCache(time.Now())
-		case sp, ok := <-i.incoming:
-			if !ok {
-				// channel's been closed; we should shut down.
-				return
+				// Briefly unlock the cache, to allow test access.
+				i.mutex.Unlock()
+				runtime.Gosched()
+				i.mutex.Lock()
+			case sp, ok := <-i.incoming:
+				if !ok {
+					// channel's been closed; we should shut down.
+					return
+				}
+				i.processSpan(sp)
+				continue
+			case sp, ok := <-i.fromPeer:
+				if !ok {
+					// channel's been closed; we should shut down.
+					return
+				}
+				i.processSpan(sp)
+				continue
+			case <-i.reload:
+				i.reloadConfigs()
 			}
-			i.processSpan(sp)
-			continue
-		case sp, ok := <-i.fromPeer:
-			if !ok {
-				// channel's been closed; we should shut down.
-				return
-			}
-			i.processSpan(sp)
-			continue
-		case <-i.reload:
-			i.reloadConfigs()
 		}
 	}
 }
 
 func (i *InMemCollector) sendTracesInCache(now time.Time) {
-	traces := i.Cache.GetAll()
-
+	traces := i.cache.TakeExpiredTraces(now)
 	for _, t := range traces {
-		if t != nil {
-			if now.After(t.SendBy) {
-				i.send(t)
-			}
-		}
+		i.send(t)
 	}
 }
 
 // processSpan does all the stuff necessary to take an incoming span and add it
 // to (or create a new placeholder for) a trace.
 func (i *InMemCollector) processSpan(sp *types.Span) {
-	trace := i.Cache.Get(sp.TraceID)
+	trace := i.cache.Get(sp.TraceID)
 	if trace == nil {
 		// if the trace has already been sent, just pass along the span
 		if sentRecord, found := i.sentTraceCache.Get(sp.TraceID); found {
@@ -284,7 +328,6 @@ func (i *InMemCollector) processSpan(sp *types.Span) {
 		i.Metrics.IncrementCounter("trace_accepted")
 
 		timeout, err := i.Config.GetTraceTimeout()
-
 		if err != nil {
 			timeout = 60 * time.Second
 		}
@@ -298,7 +341,7 @@ func (i *InMemCollector) processSpan(sp *types.Span) {
 			SendBy:    time.Now().Add(timeout),
 		}
 		// push this into the cache and if we eject an unsent trace, send it ASAP
-		ejectedTrace := i.Cache.Set(trace)
+		ejectedTrace := i.cache.Set(trace)
 		if ejectedTrace != nil {
 			i.send(ejectedTrace)
 		}
@@ -321,6 +364,7 @@ func (i *InMemCollector) processSpan(sp *types.Span) {
 		}
 
 		trace.SendBy = time.Now().Add(timeout)
+		trace.HasRootSpan = true
 	}
 }
 
@@ -328,13 +372,23 @@ func (i *InMemCollector) processSpan(sp *types.Span) {
 // on the trace has already been made, and it obeys that decision by either
 // sending the span immediately or dropping it.
 func (i *InMemCollector) dealWithSentTrace(keep bool, sampleRate uint, sp *types.Span) {
+	if i.Config.GetIsDryRun() {
+		field := i.Config.GetDryRunFieldName()
+		// if dry run mode is enabled, we keep all traces and mark the spans with the sampling decision
+		sp.Data[field] = keep
+		if !keep {
+			i.Logger.Debug().WithField("trace_id", sp.TraceID).Logf("Sending span that would have been dropped, but dry run mode is enabled")
+			i.Transmission.EnqueueSpan(sp)
+			return
+		}
+	}
 	if keep {
-		i.Logger.WithField("trace_id", sp.TraceID).Debugf("Sending span because of previous decision to send trace")
+		i.Logger.Debug().WithField("trace_id", sp.TraceID).Logf("Sending span because of previous decision to send trace")
 		sp.SampleRate *= sampleRate
 		i.Transmission.EnqueueSpan(sp)
 		return
 	}
-	i.Logger.WithField("trace_id", sp.TraceID).Debugf("Dropping span because of previous decision to drop trace")
+	i.Logger.Debug().WithField("trace_id", sp.TraceID).Logf("Dropping span because of previous decision to drop trace")
 }
 
 func isRootSpan(sp *types.Span) bool {
@@ -354,10 +408,10 @@ func (i *InMemCollector) send(trace *types.Trace) {
 		// someone else already sent this so we shouldn't also send it. This happens
 		// when two timers race and two signals for the same trace are sent down the
 		// toSend channel
-		i.Logger.
-			WithField("trace_id", trace.TraceID).
-			WithField("dataset", trace.Dataset).
-			Debugf("skipping send because someone else already sent trace to dataset")
+		i.Logger.Debug().
+			WithString("trace_id", trace.TraceID).
+			WithString("dataset", trace.Dataset).
+			Logf("skipping send because someone else already sent trace to dataset")
 		return
 	}
 	trace.Sent = true
@@ -365,21 +419,17 @@ func (i *InMemCollector) send(trace *types.Trace) {
 	traceDur := time.Now().Sub(trace.StartTime)
 	i.Metrics.Histogram("trace_duration_ms", float64(traceDur.Milliseconds()))
 	i.Metrics.Histogram("trace_span_count", float64(len(trace.GetSpans())))
+	if trace.HasRootSpan {
+		i.Metrics.IncrementCounter("trace_send_has_root")
+	} else {
+		i.Metrics.IncrementCounter("trace_send_no_root")
+	}
 
 	var sampler sample.Sampler
 	var found bool
 
 	if sampler, found = i.datasetSamplers[trace.Dataset]; !found {
 		sampler = i.SamplerFactory.GetSamplerImplementationForDataset(trace.Dataset)
-		// no dataset sampler found, use default sampler
-		if sampler == nil {
-			sampler = i.defaultSampler
-		}
-
-		if i.datasetSamplers == nil {
-			i.datasetSamplers = make(map[string]sample.Sampler)
-		}
-
 		// save sampler for later
 		i.datasetSamplers[trace.Dataset] = sampler
 	}
@@ -396,19 +446,26 @@ func (i *InMemCollector) send(trace *types.Trace) {
 	}
 	i.sentTraceCache.Add(trace.TraceID, &sentRecord)
 
-	// if we're supposed to drop this trace, then we're done.
-	if !shouldSend {
+	// if we're supposed to drop this trace, and dry run mode is not enabled, then we're done.
+	if !shouldSend && !i.Config.GetIsDryRun() {
 		i.Metrics.IncrementCounter("trace_send_dropped")
-		i.Logger.WithField("trace_id", trace.TraceID).WithField("dataset", trace.Dataset).Infof("Dropping trace because of sampling, trace to dataset")
+		i.Logger.Info().WithString("trace_id", trace.TraceID).WithString("dataset", trace.Dataset).Logf("Dropping trace because of sampling, trace to dataset")
 		return
 	}
 	i.Metrics.IncrementCounter("trace_send_kept")
 
 	// ok, we're not dropping this trace; send all the spans
-	i.Logger.WithField("trace_id", trace.TraceID).WithField("dataset", trace.Dataset).Infof("Sending trace to dataset")
+	if i.Config.GetIsDryRun() && !shouldSend {
+		i.Logger.Info().WithString("trace_id", trace.TraceID).WithString("dataset", trace.Dataset).Logf("Trace would have been dropped, but dry run mode is enabled")
+	}
+	i.Logger.Info().WithString("trace_id", trace.TraceID).WithString("dataset", trace.Dataset).Logf("Sending trace to dataset")
 	for _, sp := range trace.GetSpans() {
 		if sp.SampleRate < 1 {
 			sp.SampleRate = 1
+		}
+		if i.Config.GetIsDryRun() {
+			field := i.Config.GetDryRunFieldName()
+			sp.Data[field] = shouldSend
 		}
 		// if spans are already sampled, take that in to account when computing
 		// the final rate
@@ -420,14 +477,16 @@ func (i *InMemCollector) send(trace *types.Trace) {
 func (i *InMemCollector) Stop() error {
 	// close the incoming channel and (TODO) wait for all collectors to finish
 	close(i.incoming)
+
+	i.mutex.Lock()
+	defer i.mutex.Unlock()
+
 	// purge the collector of any in-flight traces
-	if i.Cache != nil {
-		traces := i.Cache.GetAll()
+	if i.cache != nil {
+		traces := i.cache.GetAll()
 		for _, trace := range traces {
 			if trace != nil {
-				if !trace.GetSent() {
-					i.send(trace)
-				}
+				i.send(trace)
 			}
 		}
 	}
@@ -435,4 +494,12 @@ func (i *InMemCollector) Stop() error {
 		i.Transmission.Flush()
 	}
 	return nil
+}
+
+// Convenience method for tests.
+func (i *InMemCollector) getFromCache(traceID string) *types.Trace {
+	i.mutex.RLock()
+	defer i.mutex.RUnlock()
+
+	return i.cache.Get(traceID)
 }

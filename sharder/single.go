@@ -1,7 +1,7 @@
 package sharder
 
 import (
-	"github.com/honeycombio/samproxy/logger"
+	"github.com/honeycombio/refinery/logger"
 )
 
 // SingleShard implements the Shard interface
@@ -23,6 +23,6 @@ func (s *SingleServerSharder) MyShard() Shard {
 }
 
 func (s *SingleServerSharder) WhichShard(traceID string) Shard {
-	s.Logger.WithField("trace_id", traceID).Debugf("single server sharder; choosing self for trace")
+	s.Logger.Debug().WithField("trace_id", traceID).Logf("single server sharder; choosing self for trace")
 	return &selfShard
 }

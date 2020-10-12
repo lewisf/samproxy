@@ -2,12 +2,11 @@ package sample
 
 import (
 	"crypto/sha1"
-	"fmt"
 	"math"
 
-	"github.com/honeycombio/samproxy/config"
-	"github.com/honeycombio/samproxy/logger"
-	"github.com/honeycombio/samproxy/types"
+	"github.com/honeycombio/refinery/config"
+	"github.com/honeycombio/refinery/logger"
+	"github.com/honeycombio/refinery/types"
 )
 
 // shardingSalt is a random bit to make sure we don't shard the same as any
@@ -15,53 +14,23 @@ import (
 const shardingSalt = "5VQ8l2jE5aJLPVqk"
 
 type DeterministicSampler struct {
-	Config config.Config
+	Config *config.DeterministicSamplerConfig
 	Logger logger.Logger
 
 	sampleRate int
 	upperBound uint32
-	configName string
-}
-
-type DetSamplerConfig struct {
-	SampleRate int
 }
 
 func (d *DeterministicSampler) Start() error {
-	d.Logger.Debugf("Starting DeterministicSampler")
-	defer func() { d.Logger.Debugf("Finished starting DeterministicSampler") }()
-	if err := d.loadConfigs(); err != nil {
-		return err
-	}
-
-	// listen for config reloads with an errorless version of the reload
-	d.Config.RegisterReloadCallback(func() {
-		d.Logger.Debugf("reloading deterministic sampler config")
-		if err := d.loadConfigs(); err != nil {
-			d.Logger.WithField("error", err).Errorf("failed to reload deterministic sampler configs")
-		}
-	})
-
-	return nil
-}
-
-func (d *DeterministicSampler) loadConfigs() error {
-	dsConfig := DetSamplerConfig{}
-	configKey := fmt.Sprintf("SamplerConfig.%s", d.configName)
-	err := d.Config.GetOtherConfig(configKey, &dsConfig)
-	if err != nil {
-		return err
-	}
-	if dsConfig.SampleRate < 1 {
-		d.Logger.WithField("sample_rate", dsConfig.SampleRate).Debugf("configured sample rate for deterministic sampler was less than 1; forcing to 1")
-		dsConfig.SampleRate = 1
-	}
-	d.sampleRate = dsConfig.SampleRate
+	d.Logger.Debug().Logf("Starting DeterministicSampler")
+	defer func() { d.Logger.Debug().Logf("Finished starting DeterministicSampler") }()
+	d.sampleRate = d.Config.SampleRate
 
 	// Get the actual upper bound - the largest possible value divided by
 	// the sample rate. In the case where the sample rate is 1, this should
 	// sample every value.
 	d.upperBound = math.MaxUint32 / uint32(d.sampleRate)
+
 	return nil
 }
 

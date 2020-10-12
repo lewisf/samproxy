@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/garyburd/redigo/redis"
-	"github.com/honeycombio/samproxy/config"
-	"github.com/honeycombio/samproxy/internal/redimem"
+	"github.com/honeycombio/refinery/config"
+	"github.com/honeycombio/refinery/internal/redimem"
 	"github.com/sirupsen/logrus"
   "github.com/Showmax/go-fqdn"
 )
@@ -75,7 +75,7 @@ func newRedisPeers(c config.Config) (Peers, error) {
 
 	peers := &redisPeers{
 		store: &redimem.RedisMembership{
-			Prefix: "samproxy",
+			Prefix: "refinery",
 			Pool:   pool,
 		},
 		peers:      make([]string, 1),

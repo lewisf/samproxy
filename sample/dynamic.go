@@ -1,21 +1,20 @@
 package sample
 
 import (
-	"fmt"
 	"math/rand"
 	"sort"
 	"strconv"
 
 	dynsampler "github.com/honeycombio/dynsampler-go"
 
-	"github.com/honeycombio/samproxy/config"
-	"github.com/honeycombio/samproxy/logger"
-	"github.com/honeycombio/samproxy/metrics"
-	"github.com/honeycombio/samproxy/types"
+	"github.com/honeycombio/refinery/config"
+	"github.com/honeycombio/refinery/logger"
+	"github.com/honeycombio/refinery/metrics"
+	"github.com/honeycombio/refinery/types"
 )
 
 type DynamicSampler struct {
-	Config  config.Config
+	Config  *config.DynamicSamplerConfig
 	Logger  logger.Logger
 	Metrics metrics.Metrics
 
@@ -30,49 +29,30 @@ type DynamicSampler struct {
 	dynsampler dynsampler.Sampler
 }
 
-type DynSamplerConfig struct {
-	SampleRate                   int64
-	ClearFrequencySec			 int64
-	FieldList                    []string
-	UseTraceLength               bool
-	AddSampleRateKeyToTrace      bool
-	AddSampleRateKeyToTraceField string
-}
-
 func (d *DynamicSampler) Start() error {
-	d.Logger.Debugf("Starting DynamicSampler")
-	defer func() { d.Logger.Debugf("Finished starting DynamicSampler") }()
-	dsConfig := DynSamplerConfig{}
-	configKey := fmt.Sprintf("SamplerConfig.%s", d.configName)
-	err := d.Config.GetOtherConfig(configKey, &dsConfig)
-	if err != nil {
-		return err
+	d.Logger.Debug().Logf("Starting DynamicSampler")
+	defer func() { d.Logger.Debug().Logf("Finished starting DynamicSampler") }()
+	d.sampleRate = d.Config.SampleRate
+	if d.Config.ClearFrequencySec == 0 {
+		d.Config.ClearFrequencySec = 30
 	}
-	if dsConfig.SampleRate < 1 {
-		d.Logger.Debugf("configured sample rate for dynamic sampler was %d; forcing to 1", dsConfig.SampleRate)
-		dsConfig.SampleRate = 1
-	}
-	d.sampleRate = dsConfig.SampleRate
-	if dsConfig.ClearFrequencySec == 0 {
-		dsConfig.ClearFrequencySec = 30
-	}
-	d.clearFrequencySec = dsConfig.ClearFrequencySec
+	d.clearFrequencySec = d.Config.ClearFrequencySec
 
 	// get list of fields to use when constructing the dynsampler key
-	fieldList := dsConfig.FieldList
+	fieldList := d.Config.FieldList
 
 	// always put the field list in sorted order for easier comparison
 	sort.Strings(fieldList)
 	d.fieldList = fieldList
 
-	d.useTraceLength = dsConfig.UseTraceLength
+	d.useTraceLength = d.Config.UseTraceLength
 
-	d.addDynsampleKey = dsConfig.AddSampleRateKeyToTrace
-	d.addDynsampleField = dsConfig.AddSampleRateKeyToTraceField
+	d.addDynsampleKey = d.Config.AddSampleRateKeyToTrace
+	d.addDynsampleField = d.Config.AddSampleRateKeyToTraceField
 
 	// spin up the actual dynamic sampler
 	d.dynsampler = &dynsampler.AvgSampleRate{
-		GoalSampleRate: int(d.sampleRate),
+		GoalSampleRate:    int(d.sampleRate),
 		ClearFrequencySec: int(d.clearFrequencySec),
 	}
 	d.dynsampler.Start()
@@ -82,83 +62,7 @@ func (d *DynamicSampler) Start() error {
 	d.Metrics.Register("dynsampler_num_kept", "counter")
 	d.Metrics.Register("dynsampler_sample_rate", "histogram")
 
-	// listen for config reloads
-	d.Config.RegisterReloadCallback(d.reloadConfigs)
 	return nil
-}
-
-func (d *DynamicSampler) reloadConfigs() {
-	d.Logger.Debugf("reloading config for dynamic sampler")
-	// only actually reload the dynsampler if the config changed.
-	var configChanged bool
-
-	dsConfig := DynSamplerConfig{}
-	configKey := fmt.Sprintf("SamplerConfig.%s", d.configName)
-	err := d.Config.GetOtherConfig(configKey, &dsConfig)
-	if err != nil {
-		d.Logger.Errorf("Failed to get dynsampler settings when reloading configs:", err)
-	}
-	if dsConfig.SampleRate < 1 {
-		d.Logger.Debugf("configured sample rate for dynamic sampler was %d; forcing to 1", dsConfig.SampleRate)
-		dsConfig.SampleRate = 1
-	}
-	if d.sampleRate != dsConfig.SampleRate {
-		configChanged = true
-		d.sampleRate = dsConfig.SampleRate
-	}
-	if dsConfig.ClearFrequencySec == 0 {
-		dsConfig.ClearFrequencySec = 30
-	}
-	if d.clearFrequencySec != dsConfig.ClearFrequencySec {
-		configChanged = true
-		d.clearFrequencySec = dsConfig.ClearFrequencySec
-	}
-
-	// get list of fields to use when constructing the dynsampler key
-	fieldList := dsConfig.FieldList
-	sort.Strings(fieldList)
-	// find out if the field list changed by checking that length is the same
-	// and if it is that the sorted list of fields are the same
-	if len(d.fieldList) != len(fieldList) {
-		configChanged = true
-		d.fieldList = fieldList
-	} else {
-		for i, field := range fieldList {
-			if d.fieldList[i] != field {
-				configChanged = true
-				d.fieldList = fieldList
-				break
-			}
-		}
-	}
-
-	if d.useTraceLength != dsConfig.UseTraceLength {
-		configChanged = true
-		d.useTraceLength = dsConfig.UseTraceLength
-	}
-
-	if d.addDynsampleKey != dsConfig.AddSampleRateKeyToTrace {
-		configChanged = true
-		d.addDynsampleKey = dsConfig.AddSampleRateKeyToTrace
-	}
-	if d.addDynsampleField != dsConfig.AddSampleRateKeyToTraceField {
-		configChanged = true
-		d.addDynsampleField = dsConfig.AddSampleRateKeyToTraceField
-	}
-
-	if configChanged {
-		newSampler := &dynsampler.AvgSampleRate{
-			GoalSampleRate: int(d.sampleRate),
-			ClearFrequencySec: int(d.clearFrequencySec),
-		}
-		newSampler.Start()
-
-		d.Logger.Debugf("reloaded dynsampler configs with values %+v", dsConfig)
-
-		d.dynsampler = newSampler
-	} else {
-		d.Logger.Debugf("skipping dynsampler reload because the config of %+v is unchanged from the previous state", dsConfig)
-	}
 }
 
 func (d *DynamicSampler) GetSampleRate(trace *types.Trace) (uint, bool) {
@@ -168,12 +72,12 @@ func (d *DynamicSampler) GetSampleRate(trace *types.Trace) (uint, bool) {
 		rate = 1
 	}
 	shouldKeep := rand.Intn(int(rate)) == 0
-	d.Logger.WithFields(map[string]interface{}{
+	d.Logger.Debug().WithFields(map[string]interface{}{
 		"sample_key":  key,
 		"sample_rate": rate,
 		"sample_keep": shouldKeep,
 		"trace_id":    trace.TraceID,
-	}).Debugf("got sample rate and decision")
+	}).Logf("got sample rate and decision")
 	if shouldKeep {
 		d.Metrics.IncrementCounter("dynsampler_num_kept")
 	} else {

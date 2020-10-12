@@ -5,6 +5,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	libhoney "github.com/honeycombio/libhoney-go"
@@ -16,16 +18,16 @@ import (
 	flag "github.com/jessevdk/go-flags"
 	"github.com/sirupsen/logrus"
 
-	"github.com/honeycombio/samproxy/app"
-	"github.com/honeycombio/samproxy/collect"
-	"github.com/honeycombio/samproxy/config"
-	"github.com/honeycombio/samproxy/internal/peer"
-	"github.com/honeycombio/samproxy/logger"
-	"github.com/honeycombio/samproxy/metrics"
-	"github.com/honeycombio/samproxy/sample"
-	"github.com/honeycombio/samproxy/service/debug"
-	"github.com/honeycombio/samproxy/sharder"
-	"github.com/honeycombio/samproxy/transmit"
+	"github.com/honeycombio/refinery/app"
+	"github.com/honeycombio/refinery/collect"
+	"github.com/honeycombio/refinery/config"
+	"github.com/honeycombio/refinery/internal/peer"
+	"github.com/honeycombio/refinery/logger"
+	"github.com/honeycombio/refinery/metrics"
+	"github.com/honeycombio/refinery/sample"
+	"github.com/honeycombio/refinery/service/debug"
+	"github.com/honeycombio/refinery/sharder"
+	"github.com/honeycombio/refinery/transmit"
 )
 
 // set by travis.
@@ -33,8 +35,8 @@ var BuildID string
 var version string
 
 type Options struct {
-	ConfigFile string `short:"c" long:"config" description:"Path to config file" default:"/etc/samproxy/samproxy.toml"`
-	RulesFile  string `short:"r" long:"rules_config" description:"Path to rules config file" default:"/etc/samproxy/rules.toml"`
+	ConfigFile string `short:"c" long:"config" description:"Path to config file" default:"/etc/refinery/refinery.toml"`
+	RulesFile  string `short:"r" long:"rules_config" description:"Path to rules config file" default:"/etc/refinery/rules.toml"`
 	Version    bool   `short:"v" long:"version" description:"Print version number and exit"`
 	Debug      bool   `short:"d" long:"debug" description:"If enabled, runs debug service (runs on the first open port between localhost:6060 and :6069 by default)"`
 }
@@ -58,7 +60,15 @@ func main() {
 		os.Exit(0)
 	}
 
-	c, err := config.NewConfig(opts.ConfigFile, opts.RulesFile)
+	a := app.App{
+		Version: version,
+	}
+
+	c, err := config.NewConfig(opts.ConfigFile, opts.RulesFile, func(err error) {
+		if a.Logger != nil {
+			a.Logger.Error().WithField("error", err).Logf("error reloading config")
+		}
+	})
 	if err != nil {
 		fmt.Printf("unable to load config: %+v\n", err)
 		os.Exit(1)
@@ -69,10 +79,6 @@ func main() {
 	if err != nil {
 		fmt.Printf("unable to load peers: %+v\n", err)
 		os.Exit(1)
-	}
-
-	a := app.App{
-		Version: version,
 	}
 
 	// get desired implementation for each dependency to inject
@@ -111,20 +117,21 @@ func main() {
 		TLSHandshakeTimeout: 1200 * time.Millisecond,
 	}
 
-	sdUpstream, _ := statsd.New(statsd.Prefix("samproxy.upstream"))
-	sdPeer, _ := statsd.New(statsd.Prefix("samproxy.peer"))
+	sdUpstream, _ := statsd.New(statsd.Prefix("refinery.upstream"))
+	sdPeer, _ := statsd.New(statsd.Prefix("refinery.peer"))
 
-	userAgentAddition := "samproxy/" + version
+	userAgentAddition := "refinery/" + version
 	upstreamClient, err := libhoney.NewClient(libhoney.ClientConfig{
 		Transmission: &transmission.Honeycomb{
-			MaxBatchSize:         500,
-			BatchTimeout:         libhoney.DefaultBatchTimeout,
-			MaxConcurrentBatches: libhoney.DefaultMaxConcurrentBatches,
-			PendingWorkCapacity:  uint(c.GetUpstreamBufferSize()),
-			UserAgentAddition:    userAgentAddition,
-			Transport:            upstreamTransport,
-			BlockOnSend:          true,
-			Metrics:              sdUpstream,
+			MaxBatchSize:          500,
+			BatchTimeout:          libhoney.DefaultBatchTimeout,
+			MaxConcurrentBatches:  libhoney.DefaultMaxConcurrentBatches,
+			PendingWorkCapacity:   uint(c.GetUpstreamBufferSize()),
+			UserAgentAddition:     userAgentAddition,
+			Transport:             upstreamTransport,
+			BlockOnSend:           true,
+			EnableMsgpackEncoding: true,
+			Metrics:               sdUpstream,
 		},
 	})
 	if err != nil {
@@ -140,10 +147,10 @@ func main() {
 			PendingWorkCapacity:  uint(c.GetPeerBufferSize()),
 			UserAgentAddition:    userAgentAddition,
 			Transport:            peerTransport,
-			BlockOnSend:          true,
 			// gzip compression is expensive, and peers are most likely close to each other
 			// so we can turn off gzip when forwarding to peers
 			DisableGzipCompression: true,
+			EnableMsgpackEncoding:  true,
 			Metrics:                sdPeer,
 		},
 	})
@@ -198,4 +205,12 @@ func main() {
 		fmt.Printf("failed to start injected dependencies. error: %+v\n", err)
 		os.Exit(1)
 	}
+
+	// set up signal channel to exit
+	sigsToExit := make(chan os.Signal, 1)
+	signal.Notify(sigsToExit, syscall.SIGINT, syscall.SIGTERM)
+
+	// block on our signal handler to exit
+	sig := <-sigsToExit
+	a.Logger.Error().Logf("Caught signal \"%s\"", sig)
 }
